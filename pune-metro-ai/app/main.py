@@ -16,6 +16,10 @@ from app.services.llm_client import close_llm_http_client
 
 
 logging.basicConfig(level=logging.INFO)
+# httpx includes URL query parameters in INFO logs. Provider URLs can contain
+# credentials, so retain warnings/errors while keeping secrets out of call logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @asynccontextmanager

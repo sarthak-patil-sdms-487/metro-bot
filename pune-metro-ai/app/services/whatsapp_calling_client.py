@@ -36,13 +36,14 @@ async def startup() -> None:
         return
     try:
         import aiohttp
-        from pipecat.transports.whatsapp.client import WhatsAppClient
         from app.services.voice_pipeline import preload_voice_pipeline_dependencies
 
         # Pipecat's native ONNX/Torch imports can deadlock when their first load
-        # happens in a worker thread. Application startup already waits for this
-        # preload, so initialize them on the startup thread deterministically.
+        # happens in a worker thread or after the WhatsApp WebRTC transport has
+        # partially initialized. Load the complete audio stack first, on the
+        # startup thread, then import the WhatsApp client from the warm package.
         preload_voice_pipeline_dependencies()
+        from pipecat.transports.whatsapp.client import WhatsAppClient
     except Exception:
         logger.exception("WhatsApp Calling disabled: Pipecat calling dependencies unavailable")
         return

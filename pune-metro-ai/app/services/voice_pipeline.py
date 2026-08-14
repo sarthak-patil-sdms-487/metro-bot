@@ -3,10 +3,14 @@
 import asyncio
 import hashlib
 import logging
+import math
 import re
+import sys
 import time
 import types
+import unicodedata
 import wave
+from array import array
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,7 +21,12 @@ from app.db.models import CallSession, Conversation, Message, TTSAudioCache, Use
 from app.db.session import SessionLocal
 from app.services.cost_tracking import make_llm_log, make_tts_log
 from app.services.voice_agent import voice_agent
-from app.services.collection_flow import is_additional_collection_detail
+from app.services.collection_flow import (
+    advance_collection,
+    collection_resume_reply,
+    is_additional_collection_detail,
+    start_collection,
+)
 from app.services.whatsapp_client import whatsapp_client
 from app.services.llm_client import (
     FARE_MATRIX,
@@ -29,7 +38,7 @@ from app.services.llm_client import (
     resolve_reply_language,
     short_message_intent,
 )
-from app.services.voice_dialogue import run_voice_dialogue_turn
+from app.services.voice_dialogue import VoiceTurnResult, run_voice_dialogue_turn
 
 
 logger = logging.getLogger(__name__)
@@ -43,12 +52,13 @@ GREETING_TEXT = (
 # remain public for operational checks, but no STT turn is discarded based on a
 # language score and no fixed debounce delays every response.
 TURN_AGGREGATION_DELAY_SECONDS = 0.0
-VAD_STOP_SECS = 0.6
+VAD_STOP_SECS = 0.2
 # Compatibility values used by operational checks and helper-level tests.
 MIN_TRANSCRIPTION_CONFIDENCE = 0.0
 COLLECTION_TRANSCRIPTION_CONFIDENCE = 0.0
 SUPPORTED_STT_LANGUAGES = frozenset({"en-IN", "hi-IN", "mr-IN"})
 TTS_LANGUAGE_TAG = "\u2063"
+_VOICE_DEPENDENCIES_PRELOADED = False
 
 
 def _build_vad_analyzer() -> Any:
@@ -66,6 +76,10 @@ def preload_voice_pipeline_dependencies() -> None:
     host.  Doing that work during application startup keeps the WebRTC callback
     fast enough for the caller to hear the greeting.
     """
+    global _VOICE_DEPENDENCIES_PRELOADED
+    if _VOICE_DEPENDENCIES_PRELOADED:
+        return
+
     started_at = time.monotonic()
     from pipecat.pipeline.pipeline import Pipeline  # noqa: F401
     from pipecat.pipeline.runner import PipelineRunner  # noqa: F401
@@ -85,6 +99,7 @@ def preload_voice_pipeline_dependencies() -> None:
     # Construct once so the model file is loaded and validated while starting.
     _build_vad_analyzer()
     LocalSmartTurnAnalyzerV3()
+    _VOICE_DEPENDENCIES_PRELOADED = True
     logger.info(
         "Voice pipeline dependencies preloaded in %.2fs",
         time.monotonic() - started_at,
@@ -220,6 +235,96 @@ def _language_detection_probability(frame: Any) -> float | None:
         return float(probability) if probability is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _normalized_echo_text(text: str) -> str:
+    """Normalize speech text without stripping Devanagari combining marks."""
+    characters = (
+        char.casefold()
+        for char in text
+        if char.isspace() or unicodedata.category(char)[0] in {"L", "M", "N"}
+    )
+    return " ".join("".join(characters).split())
+
+
+def _looks_like_bot_echo(transcript: str, spoken_text: str) -> bool:
+    """Return whether an STT fragment is substantially copied from bot audio."""
+    heard = _normalized_echo_text(transcript)
+    spoken = _normalized_echo_text(spoken_text)
+    if len(heard) < 4 or not spoken:
+        return False
+    if heard in spoken:
+        return True
+    heard_words = heard.split()
+    spoken_words = set(spoken.split())
+    if len(heard_words) < 2:
+        return False
+    overlap = sum(word in spoken_words for word in heard_words) / len(heard_words)
+    return overlap >= 0.8
+
+
+def _is_nonlexical_voice_noise(text: str) -> bool:
+    """Reject standalone hesitation sounds that should never create an AI turn."""
+    normalized = _normalized_echo_text(text)
+    return normalized in {
+        "hm",
+        "hmm",
+        "hmmm",
+        "mm",
+        "mmm",
+        "uh",
+        "uhh",
+        "um",
+        "umm",
+        "er",
+        "erm",
+        "हम्म",
+        "उह",
+        "उम्म",
+    }
+
+
+def _pcm16_gain(audio: bytes, gain: float) -> bytes:
+    """Apply a bounded gain to little-endian signed 16-bit PCM audio."""
+    if gain <= 1.01 or len(audio) < 2:
+        return audio
+    samples = array("h")
+    samples.frombytes(audio[: len(audio) - (len(audio) % 2)])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    boosted = array(
+        "h",
+        (
+            max(-32768, min(32767, round(sample * gain)))
+            for sample in samples
+        ),
+    )
+    if sys.byteorder == "big":
+        boosted.byteswap()
+    return boosted.tobytes()
+
+
+def _desired_pcm16_gain(audio: bytes) -> float:
+    """Return safe automatic gain for a caller frame without lifting silence."""
+    if len(audio) < 2:
+        return 1.0
+    samples = array("h")
+    samples.frombytes(audio[: len(audio) - (len(audio) % 2)])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if not samples:
+        return 1.0
+    peak = max(abs(sample) for sample in samples)
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    # Do not turn digital silence or a quiet room into apparent speech. Call 97
+    # peaked at only -34 dBFS, so genuine low-level phone speech still receives
+    # enough gain to reach the STT service cleanly.
+    if peak < 90 or rms < 35:
+        return 1.0
+    # Moderate compression is enough for quiet phone microphones. The earlier
+    # 8x ceiling pushed call 98 close to 0 dBFS and made later STT less stable.
+    target_rms = 1800.0
+    return max(1.0, min(5.0, target_rms / rms, 20000.0 / peak))
 
 
 # Compatibility for monitoring code written before the metric was correctly
@@ -593,6 +698,19 @@ def _is_actionable_barge_in(text: str, *, active_collection: bool) -> bool:
     return False
 
 
+def _is_meaningful_barge_in(text: str, *, active_collection: bool) -> bool:
+    """Allow intentional speech to interrupt TTS while ignoring tiny artifacts."""
+    normalized = _normalized_echo_text(text)
+    if not normalized or _is_nonlexical_voice_noise(normalized):
+        return False
+    if _is_actionable_barge_in(text, active_collection=active_collection):
+        return True
+    # Preserve free-form, previously unseen requests instead of requiring a
+    # fixed vocabulary. A two-word phrase is deliberate enough for barge-in;
+    # one-word commands/categories are covered by the actionable checks above.
+    return len(normalized) >= 7 and len(normalized.split()) >= 2
+
+
 def _route_clarification(text: str) -> tuple[str, str] | None:
     """Ask for missing operational stations instead of guessing a route."""
     normalized = text.casefold()
@@ -695,16 +813,17 @@ async def run_voice_pipeline(
 ) -> None:
     """Run one isolated, interruptible voice session inside this FastAPI process."""
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
         BotStoppedSpeakingFrame,
         InputAudioRawFrame,
+        InterimTranscriptionFrame,
         LLMContextFrame,
         TTSAudioRawFrame,
         TTSStoppedFrame,
         TTSSpeakFrame,
         TextFrame,
         TranscriptionFrame,
-        UserStartedSpeakingFrame,
-        UserStoppedSpeakingFrame,
+        VADUserStartedSpeakingFrame,
     )
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
@@ -718,10 +837,8 @@ async def run_voice_pipeline(
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-    from pipecat.turns.user_start import (
-        TranscriptionUserTurnStartStrategy,
-        VADUserTurnStartStrategy,
-    )
+    from pipecat.turns.types import ProcessFrameResult
+    from pipecat.turns.user_start import BaseUserTurnStartStrategy
     from pipecat.turns.user_stop import (
         SpeechTimeoutUserTurnStopStrategy,
         TurnAnalyzerUserTurnStopStrategy,
@@ -735,9 +852,89 @@ async def run_voice_pipeline(
 
     class TurnState:
         processing = False
+        processing_count = 0
         latest_transcription: Any | None = None
+        revision = 0
+        handled_revision = 0
+        frame_revisions: dict[int, int] = {}
+        active_collection = False
 
     turn_state = TurnState()
+
+    class TranscriptEchoFilter(FrameProcessor):
+        """Drop transcripts copied from recent bot audio, while preserving barge-in."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bot_speaking = False
+            self.recent_bot_text = ""
+            self.last_tts_at = 0.0
+            self.last_bot_stopped_at = 0.0
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            now = time.monotonic()
+            if isinstance(frame, TTSSpeakFrame):
+                clean_text, _ = _parse_tts_text(frame.text)
+                if now - self.last_tts_at > 2.0:
+                    self.recent_bot_text = clean_text
+                else:
+                    self.recent_bot_text = (
+                        f"{self.recent_bot_text} {clean_text}"
+                    ).strip()[-2400:]
+                self.last_tts_at = now
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                self.bot_speaking = True
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.bot_speaking = False
+                self.last_bot_stopped_at = now
+            elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+                if _is_nonlexical_voice_noise(frame.text):
+                    logger.info("Suppressed nonlexical STT artifact: %r", frame.text)
+                    return
+                in_echo_window = self.bot_speaking or (
+                    now - self.last_bot_stopped_at <= 1.2
+                )
+                if in_echo_window and _looks_like_bot_echo(
+                    frame.text, self.recent_bot_text
+                ):
+                    logger.info("Suppressed bot audio echo transcription: %r", frame.text)
+                    return
+                if self.bot_speaking and not _is_meaningful_barge_in(
+                    frame.text,
+                    active_collection=turn_state.active_collection,
+                ):
+                    logger.info(
+                        "Suppressed non-actionable transcription during bot speech: %r",
+                        frame.text,
+                    )
+                    return
+            await self.push_frame(frame, direction)
+
+    class EchoAwareUserTurnStartStrategy(BaseUserTurnStartStrategy):
+        """Use VAD normally, but require non-echo text to interrupt bot speech."""
+
+        def __init__(self) -> None:
+            super().__init__(enable_interruptions=True)
+            self.bot_speaking = False
+
+        async def process_frame(self, frame: Any) -> ProcessFrameResult:
+            if isinstance(frame, BotStartedSpeakingFrame):
+                self.bot_speaking = True
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.bot_speaking = False
+            elif isinstance(frame, VADUserStartedSpeakingFrame) and not self.bot_speaking:
+                await self.trigger_user_turn_started()
+                return ProcessFrameResult.STOP
+            elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+                if self.bot_speaking and not _is_meaningful_barge_in(
+                    frame.text,
+                    active_collection=turn_state.active_collection,
+                ):
+                    return ProcessFrameResult.CONTINUE
+                await self.trigger_user_turn_started()
+                return ProcessFrameResult.STOP
+            return ProcessFrameResult.CONTINUE
 
     class TranscriptionMetadataCapture(FrameProcessor):
         """Keep provider metadata while native smart-turn aggregates text."""
@@ -776,17 +973,17 @@ async def run_voice_pipeline(
                 return
             metadata = turn_state.latest_transcription
             logger.info("Smart turn completed: %r", content.strip())
-            await self.push_frame(
-                TranscriptionFrame(
-                    text=content.strip(),
-                    user_id=getattr(metadata, "user_id", str(user_id)),
-                    timestamp=getattr(metadata, "timestamp", ""),
-                    language=getattr(metadata, "language", None),
-                    result=getattr(metadata, "result", None),
-                    finalized=True,
-                ),
-                direction,
+            completed_frame = TranscriptionFrame(
+                text=content.strip(),
+                user_id=getattr(metadata, "user_id", str(user_id)),
+                timestamp=getattr(metadata, "timestamp", ""),
+                language=getattr(metadata, "language", None),
+                result=getattr(metadata, "result", None),
+                finalized=True,
             )
+            turn_state.revision += 1
+            turn_state.frame_revisions[id(completed_frame)] = turn_state.revision
+            await self.push_frame(completed_frame, direction)
 
     class AIDialogueProcessor(FrameProcessor):
         """Run every completed caller turn through the structured controller."""
@@ -802,6 +999,9 @@ async def run_voice_pipeline(
                 return
 
             text = frame.text.strip()
+            turn_revision = turn_state.frame_revisions.pop(
+                id(frame), turn_state.revision
+            )
             started = time.monotonic()
             db = None
             reply = ""
@@ -810,9 +1010,16 @@ async def run_voice_pipeline(
             )
             chat_notification: str | None = None
             notification_number: str | None = None
+            turn_state.processing_count += 1
             turn_state.processing = True
             try:
                 async with self.turn_lock:
+                    if turn_revision <= turn_state.handled_revision:
+                        logger.info(
+                            "Skipped a caller fragment already coalesced into the prior turn: %r",
+                            text,
+                        )
+                        return
                     db = SessionLocal()
                     conversation = db.get(Conversation, conversation_id)
                     if conversation is None:
@@ -848,20 +1055,149 @@ async def run_voice_pipeline(
                         (item.content for item in stored if item.role == "assistant"),
                         None,
                     )
-                    result = await run_voice_dialogue_turn(
-                        text=text,
-                        conversation=conversation,
-                        history=[
-                            {"role": item.role, "content": item.content}
-                            for item in reversed(stored)
-                            if item.role in {"user", "assistant"}
-                        ],
-                        db=db,
-                        language_hint=response_language,
-                        last_assistant_reply=last_assistant,
+                    state_before = conversation.complaint_collection_state
+                    preferred_language = conversation.preferred_language
+                    collection_language = (
+                        preferred_language
+                        if preferred_language in {"english", "hindi", "marathi"}
+                        else response_language
+                    )
+                    closing_reply = _call_closing_reply(text, response_language)
+                    fast_reply = _fast_voice_reply(text)
+                    short_intent = short_message_intent(text)
+                    category = (
+                        voice_agent.collection_category(text)
+                        if state_before is None
+                        else None
+                    )
+                    if closing_reply:
+                        result = VoiceTurnResult(
+                            reply_text=closing_reply,
+                            language=response_language,
+                            intent="close",
+                            provider="local",
+                            model="deterministic-voice-control",
+                            state_before=conversation.complaint_collection_state,
+                            state_after=conversation.complaint_collection_state,
+                        )
+                    elif category:
+                        reply_text = start_collection(
+                            conversation,
+                            category,
+                            text,
+                            language=response_language,
+                        )
+                        result = VoiceTurnResult(
+                            reply_text=reply_text,
+                            language=response_language,
+                            intent={
+                                "complaint": "start_complaint",
+                                "suggestion": "start_suggestion",
+                                "appreciation": "start_appreciation",
+                            }.get(category, "start_complaint"),
+                            provider="local",
+                            model="deterministic-collection-start",
+                            state_before=None,
+                            state_after=conversation.complaint_collection_state,
+                        )
+                    elif state_before and fast_reply and (
+                        short_intent == "greeting"
+                        or voice_agent.is_explicit_enquiry(text)
+                    ):
+                        fast_text, fast_language = fast_reply
+                        if short_intent == "greeting":
+                            # A bare "Hello" checks whether the bot is present;
+                            # it is not evidence that the caller changed language.
+                            fast_text = {
+                                "english": "Yes, I’m here and listening.",
+                                "hindi": "जी, मैं यहीं हूँ और सुन रही हूँ।",
+                                "marathi": "हो, मी इथेच आहे आणि ऐकतेय.",
+                            }.get(collection_language, "Yes, I’m here and listening.")
+                        else:
+                            collection_language = fast_language
+                            conversation.preferred_language = fast_language
+                        response_language = collection_language
+                        resume_reply = collection_resume_reply(conversation)
+                        result = VoiceTurnResult(
+                            reply_text=f"{fast_text} {resume_reply}",
+                            language=collection_language,
+                            intent="greeting" if short_intent == "greeting" else "metro_enquiry",
+                            provider="local",
+                            model="verified-collection-diversion",
+                            state_before=state_before,
+                            state_after=conversation.complaint_collection_state,
+                        )
+                    elif state_before and not voice_agent.is_explicit_enquiry(text):
+                        response_language = collection_language
+                        collection_reply, completed = advance_collection(
+                            conversation, text, db
+                        )
+                        tracking_match = re.search(
+                            r"PMC-\d{6}", collection_reply, re.I
+                        )
+                        result = VoiceTurnResult(
+                            reply_text=collection_reply,
+                            language=collection_language,
+                            intent=(
+                                "confirm"
+                                if state_before == "confirming"
+                                else "provide_fields"
+                            ),
+                            provider="local",
+                            model="deterministic-collection-step",
+                            state_before=state_before,
+                            state_after=conversation.complaint_collection_state,
+                            completed=completed,
+                            tracking_id=(
+                                tracking_match.group(0) if tracking_match else None
+                            ),
+                        )
+                    elif fast_reply:
+                        fast_text, fast_language = fast_reply
+                        response_language = fast_language
+                        result = VoiceTurnResult(
+                            reply_text=fast_text,
+                            language=fast_language,
+                            intent=(
+                                "greeting"
+                                if short_intent == "greeting"
+                                else "metro_enquiry"
+                            ),
+                            provider="local",
+                            model="verified-voice-fast-path",
+                            state_before=None,
+                            state_after=None,
+                        )
+                    else:
+                        result = await run_voice_dialogue_turn(
+                            text=text,
+                            conversation=conversation,
+                            history=[
+                                {"role": item.role, "content": item.content}
+                                for item in reversed(stored)
+                                if item.role in {"user", "assistant"}
+                            ],
+                            db=db,
+                            language_hint=response_language,
+                            last_assistant_reply=last_assistant,
+                        )
+                    if turn_revision < turn_state.revision:
+                        logger.info(
+                            "Coalesced caller fragments through revision %s while answering %r",
+                            turn_state.revision,
+                            text,
+                        )
+                    # Deliver one coherent response, then consume any short
+                    # fragments that arrived during its computation. This avoids
+                    # both back-to-back replies and infinite latest-wins starvation.
+                    turn_state.handled_revision = max(
+                        turn_state.handled_revision, turn_state.revision
                     )
                     response_language = result.language
                     reply = result.reply_text.strip()
+                    turn_state.active_collection = bool(
+                        conversation.complaint_collection_state
+                    )
 
                     if result.intent == "close":
                         reply = _call_closing_reply(text, response_language) or {
@@ -933,7 +1269,8 @@ async def run_voice_pipeline(
             finally:
                 if db is not None:
                     db.close()
-                turn_state.processing = False
+                turn_state.processing_count = max(0, turn_state.processing_count - 1)
+                turn_state.processing = turn_state.processing_count > 0
 
             if chat_notification and notification_number:
                 try:
@@ -978,6 +1315,30 @@ async def run_voice_pipeline(
                 and time.monotonic() - self.started_at < 0.8
             ):
                 return
+            await self.push_frame(frame, direction)
+
+    class InputAudioNormalizer(FrameProcessor):
+        """Raise unusually quiet caller audio before VAD and Sarvam STT."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.smoothed_gain = 1.0
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            if (
+                direction == FrameDirection.DOWNSTREAM
+                and isinstance(frame, InputAudioRawFrame)
+            ):
+                desired = _desired_pcm16_gain(frame.audio)
+                if desired > 1.0:
+                    smoothing = 0.45 if desired > self.smoothed_gain else 0.18
+                    self.smoothed_gain += smoothing * (
+                        desired - self.smoothed_gain
+                    )
+                    frame.audio = _pcm16_gain(frame.audio, self.smoothed_gain)
+                else:
+                    self.smoothed_gain += 0.08 * (1.0 - self.smoothed_gain)
             await self.push_frame(frame, direction)
 
     class CallEndDetector(FrameProcessor):
@@ -1192,10 +1553,7 @@ async def run_voice_pipeline(
         smart_turn_context,
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
-                start=[
-                    VADUserTurnStartStrategy(enable_interruptions=True),
-                    TranscriptionUserTurnStartStrategy(use_interim=True),
-                ],
+                start=[EchoAwareUserTurnStartStrategy()],
                 stop=[
                     TurnAnalyzerUserTurnStopStrategy(
                         turn_analyzer=LocalSmartTurnAnalyzerV3(),
@@ -1215,10 +1573,12 @@ async def run_voice_pipeline(
         [
             transport.input(),
             GreetingProtector(),
+            InputAudioNormalizer(),
             VADProcessor(
                 vad_analyzer=_build_vad_analyzer()
             ),
             stt,
+            TranscriptEchoFilter(),
             TranscriptionMetadataCapture(),
             smart_turn_pair.user(),
             SmartTurnBridge(),

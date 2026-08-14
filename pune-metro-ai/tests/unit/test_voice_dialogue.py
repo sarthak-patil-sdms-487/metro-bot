@@ -49,6 +49,35 @@ def _apply(
     )
 
 
+def test_provider_string_nulls_are_normalized_without_fallback() -> None:
+    decision = VoiceTurnDecision.model_validate(
+        {
+            "intent": "greeting",
+            "language": "hindi",
+            "category": "null",
+            "fields": {
+                "full_name": "null",
+                "contact_number": "none",
+                "station": "",
+                "description": "N/A",
+            },
+            "origin_station": "null",
+            "destination_station": "null",
+            "tracking_id": "null",
+            "next_field": "null",
+            "reply_text": "नमस्कार, मैं आपकी कैसे मदद कर सकती हूँ?",
+            "confidence": 0.9,
+        }
+    )
+
+    assert decision.category is None
+    assert decision.fields == VoiceFieldUpdates()
+    assert decision.origin_station is None
+    assert decision.destination_station is None
+    assert decision.tracking_id is None
+    assert decision.next_field == "none"
+
+
 def test_last_call_replay_collects_facts_answers_status_and_registers_once(
     db: Session,
 ) -> None:
@@ -196,6 +225,35 @@ def test_non_name_is_not_inferred_from_raw_text_when_model_extracts_no_name(
     assert conversation.complaint_collection_state == "collecting_name"
     assert result.validation_errors == ("missing_name",)
     assert "couldn't catch your name" in result.reply_text.casefold()
+
+
+def test_name_from_history_cannot_be_attached_to_a_hello_turn(db: Session) -> None:
+    conversation = _conversation(db)
+    conversation.pending_category = "complaint"
+    conversation.preferred_language = "english"
+    conversation.complaint_collection_state = "collecting_name"
+
+    result = apply_voice_decision(
+        decision=VoiceTurnDecision(
+            intent="provide_fields",
+            language="english",
+            fields=VoiceFieldUpdates(full_name="Sarthak"),
+            next_field="contact",
+            reply_text="Thanks, Sarthak. What is your contact number?",
+            confidence=0.95,
+        ),
+        text="Hello",
+        conversation=conversation,
+        db=db,
+        provider="test",
+        model="test-controller",
+        controller_latency_ms=1,
+    )
+
+    assert conversation.complaint_collection_full_name is None
+    assert conversation.complaint_collection_state == "collecting_name"
+    assert result.validation_errors == ("invalid_name",)
+    assert "name" in result.reply_text.casefold()
 
 
 def test_related_fare_diversion_uses_exact_tool_and_keeps_collection_state(

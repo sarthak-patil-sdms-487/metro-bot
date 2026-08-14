@@ -163,6 +163,9 @@ def _is_valid_name(value: str) -> bool:
     invalid = {
         "hmm", "hm", "okay", "ok", "yes", "no", "हो", "नाही", "हां", "हाँ",
         "काय", "क्या", "what", "आहे", "आहेत", "है", "हैं", "is", "am",
+        "hi", "hello", "hey", "question", "thanks", "thank you", "test",
+        "हेलो", "हॅलो", "नमस्कार", "नमस्ते", "प्रश्न", "सवाल", "धन्यवाद",
+        "बरं", "ठीक", "ठीक आहे", "अच्छा", "ठीक है",
         "माझं नाव काय आहे", "माझे नाव काय आहे", "मेरा नाम क्या है",
     }
     meta = ("already told", "आधीच", "पहले ही", "नाव काय", "नाम क्या")
@@ -180,13 +183,19 @@ def _is_valid_name(value: str) -> bool:
         "मेरा", "मेरी", "नाम", "है", "हैं", "मैं", "बताइए", "बताता", "बताती",
     }
     words = normalized.split()
+    def supported_name_character(char: str) -> bool:
+        if char in "-'’":
+            return True
+        if not unicodedata.category(char).startswith(("L", "M")):
+            return False
+        # The voice bot currently promises English, Hindi and Marathi. Reject
+        # unrelated scripts produced by uncertain automatic language detection
+        # instead of storing those artifacts as a citizen's name.
+        unicode_name = unicodedata.name(char, "")
+        return "LATIN" in unicode_name or "DEVANAGARI" in unicode_name
+
     valid_name_characters = all(
-        all(
-            unicodedata.category(char).startswith(("L", "M"))
-            or char in "-'’"
-            for char in word
-        )
-        for word in words
+        all(supported_name_character(char) for char in word) for word in words
     )
     return (
         2 <= len(normalized) <= 80

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -46,6 +46,18 @@ from app.services.tools.tracking import check_tracking
 
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_optional(value: object) -> object:
+    """Normalize common JSON-null spellings emitted by small controller models."""
+    if isinstance(value, str) and value.strip().casefold() in {
+        "",
+        "null",
+        "none",
+        "n/a",
+    }:
+        return None
+    return value
 
 VoiceLanguage = Literal["english", "hindi", "marathi"]
 VoiceIntent = Literal[
@@ -78,6 +90,14 @@ class VoiceFieldUpdates(BaseModel):
     station: str | None = Field(default=None, max_length=120)
     description: str | None = Field(default=None, max_length=1000)
 
+    _normalize_optional_fields = field_validator(
+        "full_name",
+        "contact_number",
+        "station",
+        "description",
+        mode="before",
+    )(_provider_optional)
+
 
 class VoiceTurnDecision(BaseModel):
     """Provider-neutral structured result from the dialogue controller."""
@@ -94,6 +114,24 @@ class VoiceTurnDecision(BaseModel):
     next_field: NextField = "none"
     reply_text: str = Field(min_length=1, max_length=1200)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    _normalize_optional_fields = field_validator(
+        "category",
+        "origin_station",
+        "destination_station",
+        "tracking_id",
+        mode="before",
+    )(_provider_optional)
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def _normalize_fields_object(cls, value: object) -> object:
+        return {} if _provider_optional(value) is None else value
+
+    @field_validator("next_field", mode="before")
+    @classmethod
+    def _normalize_next_field(cls, value: object) -> object:
+        return "none" if _provider_optional(value) is None else value
 
 
 @dataclass(frozen=True)
@@ -335,7 +373,18 @@ def _normal_name(candidate: str | None, raw_text: str) -> str | None:
     reducer only validates its candidate and provides a conservative explicit
     phrase fallback.
     """
-    for value in (candidate, _extract_name(raw_text)):
+    explicit_name = _extract_name(raw_text)
+    supported_candidate: str | None = None
+    if candidate:
+        candidate_words = re.findall(r"[^\W_]+", candidate.casefold(), re.UNICODE)
+        raw_words = set(re.findall(r"[^\W_]+", raw_text.casefold(), re.UNICODE))
+        # The controller sees conversation history, but a field update is valid
+        # only when its words are present in this caller turn. This prevents an
+        # old self-introduction from becoming the complaint name after "Hello".
+        if candidate_words and all(word in raw_words for word in candidate_words):
+            supported_candidate = candidate
+
+    for value in (supported_candidate, explicit_name):
         if not value:
             continue
         normalized = " ".join(value.strip(" .!?।").split())

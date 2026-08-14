@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 from app.services.voice_pipeline import (
@@ -8,14 +9,19 @@ from app.services.voice_pipeline import (
     _build_vad_analyzer,
     _call_closing_reply,
     _continue_call_after_collection,
+    _desired_pcm16_gain,
     _fast_voice_reply,
     _is_explicit_thank_you,
     _is_no_more_enquiry,
     _is_incomplete_voice_fragment,
     _is_actionable_barge_in,
+    _is_meaningful_barge_in,
+    _is_nonlexical_voice_noise,
     _language_detection_probability,
+    _looks_like_bot_echo,
     _mentions_planned_line,
     _parse_tts_text,
+    _pcm16_gain,
     _offer_more_help,
     _offered_more_help,
     _route_clarification,
@@ -31,7 +37,52 @@ from app.services.qa_cache import is_cacheable_question
 
 def test_voice_endpointing_is_fast_but_tolerates_natural_pauses() -> None:
     assert TURN_AGGREGATION_DELAY_SECONDS < 1.0
-    assert 0.5 <= VAD_STOP_SECS <= 1.2
+    assert 0.15 <= VAD_STOP_SECS <= 0.3
+
+
+def test_bot_echo_is_suppressed_without_blocking_real_barge_in() -> None:
+    greeting = (
+        "नमस्कार! सेवा गुणवत्ता आणि नोंदीसाठी ही कॉल रेकॉर्ड केली जाऊ शकते. "
+        "मी पुणे मेट्रोची सहाय्यक बोलते."
+    )
+
+    assert _looks_like_bot_echo("नमस्कार, सेवा गुणवत्ता", greeting) is True
+    assert _looks_like_bot_echo("सेवा गुणवत्ता आणि नोंदीसाठी", greeting) is True
+    assert _looks_like_bot_echo("Hello, I need help with a complaint", greeting) is False
+    assert _looks_like_bot_echo("Stop", greeting) is False
+
+
+def test_voice_noise_does_not_become_a_dialogue_turn() -> None:
+    assert _is_nonlexical_voice_noise("Hmm") is True
+    assert _is_nonlexical_voice_noise("umm...") is True
+    assert _is_nonlexical_voice_noise("I have a complaint") is False
+    assert _is_nonlexical_voice_noise("Thank you") is False
+
+
+def test_barge_in_requires_deliberate_speech_but_accepts_free_form_requests() -> None:
+    assert _is_meaningful_barge_in("Hmm", active_collection=False) is False
+    assert _is_meaningful_barge_in("Stop", active_collection=False) is True
+    assert _is_meaningful_barge_in(
+        "Please help me", active_collection=False
+    ) is True
+    assert _is_meaningful_barge_in(
+        "I want to report a broken lift", active_collection=False
+    ) is True
+
+
+def test_quiet_pcm_is_safely_boosted_without_amplifying_silence() -> None:
+    quiet = array("h", [120, -180, 240, -300] * 80).tobytes()
+    silence = array("h", [0] * 320).tobytes()
+    loud = array("h", [9000, -12000, 14000, -10000] * 80).tobytes()
+
+    gain = _desired_pcm16_gain(quiet)
+    boosted = array("h")
+    boosted.frombytes(_pcm16_gain(quiet, gain))
+
+    assert gain > 1.0
+    assert max(abs(value) for value in boosted) > 300
+    assert _desired_pcm16_gain(silence) == 1.0
+    assert _desired_pcm16_gain(loud) == 1.0
 
 
 def test_lift_closed_incident_stays_in_complaint_flow_not_timetable() -> None:
@@ -165,6 +216,14 @@ def test_voice_greeting_uses_deterministic_fast_path() -> None:
     assert reply is not None
     assert reply[1] == "english"
     assert "help" in reply[0].casefold()
+
+
+def test_short_acknowledgment_never_starts_name_collection() -> None:
+    reply = _fast_voice_reply("Okay")
+
+    assert reply is not None
+    assert "anything else" in reply[0].casefold()
+    assert "name" not in reply[0].casefold()
 
 
 def test_presence_and_destination_meaning_use_fast_local_replies() -> None:

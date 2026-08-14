@@ -86,6 +86,9 @@ def test_invalid_name_repeats_name_question_without_advancing(db: Session) -> No
         "मेरा नाम है।",
         "My name is",
         "I want to register a complaint",
+        "Hello",
+        "Question",
+        "সেটা চাইছে।",
     ),
 )
 def test_incomplete_or_non_name_transcript_is_never_stored(
