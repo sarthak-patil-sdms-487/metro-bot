@@ -12,37 +12,70 @@ from app.api.whatsapp_webhook import receive_webhook
 async def test_feedback_after_ticket_confirmation(db: Session) -> None:
     """Verify that feedback is requested after a ticket is confirmed."""
     user = User(whatsapp_number="1234567890")
-    conversation = Conversation(user_id=user.id, complaint_collection_state="confirming")
-    db.add_all([user, conversation])
+    db.add(user)
+    db.flush()
+    conversation = Conversation(
+        user_id=user.id,
+        complaint_collection_state="confirming",
+        complaint_collection_full_name="Test User",
+        complaint_collection_contact_number="9876543210",
+        complaint_collection_station="PCMC",
+        complaint_collection_description="The station lift was not working.",
+        pending_category="complaint",
+    )
+    db.add(conversation)
     db.commit()
 
     with patch("app.api.whatsapp_webhook.whatsapp_client", new_callable=AsyncMock) as mock_whatsapp_client:
-        with patch("app.api.whatsapp_webhook.create_complaint_tracking") as mock_create_complaint:
-            mock_create_complaint.return_value.token = "test-token"
-            payload = _get_whatsapp_payload("yes")
-            await receive_webhook(payload, db)
-            # The last call should be the feedback request
-            mock_whatsapp_client.send_interactive_list.assert_called_once()
+        payload = _get_whatsapp_payload("yes")
+        await receive_webhook(payload, db)
+        mock_whatsapp_client.send_interactive_list.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_feedback_after_enquiry(db: Session) -> None:
     """Verify that feedback is requested after an enquiry is answered and the user says thanks."""
     user = User(whatsapp_number="1234567890")
+    db.add(user)
+    db.flush()
     conversation = Conversation(user_id=user.id)
-    db.add_all([user, conversation])
+    db.add(conversation)
     db.commit()
 
     with patch("app.api.whatsapp_webhook.whatsapp_client", new_callable=AsyncMock) as mock_whatsapp_client:
         # Simulate an enquiry and then a thank you
-        with patch("app.services.llm_client.classify_message") as mock_classify:
-            mock_classify.return_value = {"intent": "direct_query", "classification_confident": True, "categories": ["enquiry"], "detected_language": "english"}
+        with patch("app.api.whatsapp_webhook.classify_message") as mock_classify:
+            mock_classify.return_value = {
+                "intent": "direct_query",
+                "classification_confident": True,
+                "categories": ["enquiry"],
+                "subcategories": [],
+                "detected_language": "english",
+                "reference_topics": ["timetable"],
+                "asking_about_complaint_status": False,
+                "extracted_details": {
+                    "metro_station": None,
+                    "ticket_number": None,
+                    "payment_method": None,
+                    "passenger_name": None,
+                },
+            }
             payload = _get_whatsapp_payload("What time is the last metro?")
-            await receive_webhook(payload, db)
+            with patch(
+                "app.api.whatsapp_webhook.generate_reply",
+                new_callable=AsyncMock,
+                return_value="The last metro timing depends on the terminal; please check the timetable.",
+            ):
+                await receive_webhook(payload, db)
 
             mock_classify.return_value = {"intent": "acknowledgment", "classification_confident": True}
             payload = _get_whatsapp_payload("Thanks!")
-            await receive_webhook(payload, db)
+            with patch(
+                "app.api.whatsapp_webhook.generate_closing_reply",
+                new_callable=AsyncMock,
+                return_value="You're welcome.",
+            ):
+                await receive_webhook(payload, db)
             mock_whatsapp_client.send_interactive_list.assert_called_once()
 
 
@@ -50,15 +83,22 @@ async def test_feedback_after_enquiry(db: Session) -> None:
 async def test_no_duplicate_feedback_prompts(db: Session) -> None:
     """Verify that feedback is only requested once per conversation."""
     user = User(whatsapp_number="1234567890")
+    db.add(user)
+    db.flush()
     conversation = Conversation(user_id=user.id, is_closed=True)
-    db.add_all([user, conversation])
+    db.add(conversation)
     db.commit()
 
     with patch("app.api.whatsapp_webhook.whatsapp_client", new_callable=AsyncMock) as mock_whatsapp_client:
-        with patch("app.services.llm_client.classify_message") as mock_classify:
+        with patch("app.api.whatsapp_webhook.classify_message") as mock_classify:
             mock_classify.return_value = {"intent": "acknowledgment", "classification_confident": True}
             payload = _get_whatsapp_payload("Thanks!")
-            await receive_webhook(payload, db)
+            with patch(
+                "app.api.whatsapp_webhook.generate_closing_reply",
+                new_callable=AsyncMock,
+                return_value="You're welcome.",
+            ):
+                await receive_webhook(payload, db)
             mock_whatsapp_client.send_interactive_list.assert_not_called()
 
 
@@ -66,8 +106,10 @@ async def test_no_duplicate_feedback_prompts(db: Session) -> None:
 async def test_feedback_rating_persists(db: Session) -> None:
     """Verify that the feedback rating is persisted to the database."""
     user = User(whatsapp_number="1234567890")
+    db.add(user)
+    db.flush()
     conversation = Conversation(user_id=user.id)
-    db.add_all([user, conversation])
+    db.add(conversation)
     db.commit()
 
     with patch("app.api.whatsapp_webhook.whatsapp_client", new_callable=AsyncMock):
@@ -91,7 +133,7 @@ def _get_whatsapp_payload(message_text: str) -> dict:
                             "messages": [
                                 {
                                     "from": "1234567890",
-                                    "id": "wamid.test",
+                                    "id": f"wamid.test.{abs(hash(message_text))}",
                                     "text": {"body": message_text},
                                     "type": "text",
                                 }

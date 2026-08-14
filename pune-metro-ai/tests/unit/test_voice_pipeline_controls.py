@@ -13,6 +13,7 @@ from app.services.voice_pipeline import (
     _is_no_more_enquiry,
     _is_incomplete_voice_fragment,
     _is_actionable_barge_in,
+    _language_detection_probability,
     _mentions_planned_line,
     _parse_tts_text,
     _offer_more_help,
@@ -20,7 +21,6 @@ from app.services.voice_pipeline import (
     _route_clarification,
     _sanitize_voice_reply,
     _sanitize_reply_with_end_marker,
-    _transcription_confidence,
     _transcription_language_code,
     _tag_tts_text,
     _tts_language,
@@ -142,16 +142,16 @@ def test_thank_you_detection_preserves_closing_during_busy_turn() -> None:
     assert _is_explicit_thank_you("okay") is False
 
 
-def test_sarvam_transcription_confidence_is_extracted() -> None:
+def test_sarvam_language_probability_is_metadata_not_stt_confidence() -> None:
     frame = SimpleNamespace(
         result={"data": {"language_probability": 0.977}},
     )
 
-    assert _transcription_confidence(frame) == 0.977
+    assert _language_detection_probability(frame) == 0.977
 
 
-def test_missing_transcription_confidence_is_allowed() -> None:
-    assert _transcription_confidence(SimpleNamespace(result=None)) is None
+def test_missing_language_probability_is_allowed() -> None:
+    assert _language_detection_probability(SimpleNamespace(result=None)) is None
 
 
 def test_sarvam_transcription_language_is_extracted() -> None:

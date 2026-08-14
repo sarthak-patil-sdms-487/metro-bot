@@ -486,7 +486,7 @@ async def test_full_confusion_repro_ends_with_one_greeting_menu(
     await webhook.receive_webhook(_text_webhook("wamid.greeting.1", "Heyy"), db)
 
     assert len(outbound_lists) == 2
-    assert len(outbound_texts) == 2
+    assert len(outbound_texts) == 1
     assert outbound_texts[0]["body"] == webhook.CONFUSION_HANDOFF_REPLY
     assert [row["title"] for row in outbound_lists[-1]["sections"][0]["rows"]] == [
         "Complaint", "Suggestion", "Appreciation", "Enquiry", "Others",
@@ -520,7 +520,7 @@ async def test_duplicate_greeting_webhook_id_sends_exactly_one_outbound_menu(
 
 
 @pytest.mark.asyncio
-async def test_complaint_submission_returns_a_pending_tracking_token_without_phone_number(
+async def test_complaint_requires_validated_fields_and_confirmation_before_tracking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outbound_texts: list[dict] = []
@@ -537,8 +537,9 @@ async def test_complaint_submission_returns_a_pending_tracking_token_without_pho
         outbound_texts.append(kwargs)
 
     monkeypatch.setattr(webhook, "classify_message", complaint_classifier)
-    monkeypatch.setattr(webhook, "create_complaint_tracking", create_tracking)
-    monkeypatch.setattr(webhook, "notify_admin_dashboard", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.services.collection_flow.create_complaint_tracking", create_tracking
+    )
     monkeypatch.setattr(webhook.whatsapp_client, "send_text_message", send_text)
     db = WebhookSession()
 
@@ -546,20 +547,19 @@ async def test_complaint_submission_returns_a_pending_tracking_token_without_pho
         _text_webhook("wamid.complaint.1", "The lift at PCMC is not working"), db
     )
 
-    assert len(created) == 1
-    assert outbound_texts[0]["body"] == (
-        "Namaskar! Thank you for reporting this. Your complaint has been logged with "
-        "tracking ID PMC-482913. Our team will review it and follow up with you once "
-        "processed."
-    )
+    assert created == []
+    assert db.conversation.pending_category == "complaint"
+    assert db.conversation.complaint_collection_state == "collecting_name"
     reply = outbound_texts[0]["body"].casefold()
+    assert "name" in reply
+    assert "pmc-" not in reply
     assert "phone" not in reply
     assert "helpline" not in reply
     assert "1800" not in reply
 
 
 @pytest.mark.asyncio
-async def test_suggestion_submission_gets_reference_acknowledgment(
+async def test_suggestion_requires_details_and_confirmation_before_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outbound_texts: list[dict] = []
@@ -576,7 +576,9 @@ async def test_suggestion_submission_gets_reference_acknowledgment(
         outbound_texts.append(kwargs)
 
     monkeypatch.setattr(webhook, "classify_message", suggestion_classifier)
-    monkeypatch.setattr(webhook, "create_complaint_tracking", create_tracking)
+    monkeypatch.setattr(
+        "app.services.collection_flow.create_complaint_tracking", create_tracking
+    )
     monkeypatch.setattr(webhook.whatsapp_client, "send_text_message", send_text)
     db = WebhookSession()
 
@@ -584,15 +586,12 @@ async def test_suggestion_submission_gets_reference_acknowledgment(
         _text_webhook("wamid.suggestion.1", "Please add more bicycle parking"), db
     )
 
-    assert len(created) == 1
-    assert created[0]["category"] == "suggestion"
-    assert outbound_texts == [{
-        "to": "919999999999",
-        "body": (
-            "Namaskar! Thanks for the suggestion! We've noted it with reference ID "
-            "PMC-123456. Our team reviews suggestions periodically as we plan improvements."
-        ),
-    }]
+    assert created == []
+    assert db.conversation.pending_category == "suggestion"
+    assert db.conversation.complaint_collection_state == "collecting_name"
+    assert len(outbound_texts) == 1
+    assert "name" in outbound_texts[0]["body"].casefold()
+    assert "PMC-" not in outbound_texts[0]["body"]
     assert "complaint" not in outbound_texts[0]["body"].casefold()
 
 
@@ -615,7 +614,9 @@ async def test_untracked_category_creates_no_tracking_row(
 
     monkeypatch.setattr(webhook, "classify_message", classifier)
     monkeypatch.setattr(webhook, "generate_reply", normal_reply)
-    monkeypatch.setattr(webhook, "create_complaint_tracking", tracking_must_not_run)
+    monkeypatch.setattr(
+        "app.services.collection_flow.create_complaint_tracking", tracking_must_not_run
+    )
     monkeypatch.setattr(webhook.whatsapp_client, "send_text_message", send_text)
 
     await webhook.receive_webhook(
@@ -624,7 +625,7 @@ async def test_untracked_category_creates_no_tracking_row(
 
 
 @pytest.mark.asyncio
-async def test_complaint_and_suggestion_create_separate_tracking_rows(
+async def test_multi_category_turn_starts_one_confirmable_workflow_without_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outbound_texts: list[dict] = []
@@ -646,8 +647,9 @@ async def test_complaint_and_suggestion_create_separate_tracking_rows(
         outbound_texts.append(kwargs)
 
     monkeypatch.setattr(webhook, "classify_message", classifier)
-    monkeypatch.setattr(webhook, "create_complaint_tracking", create_tracking)
-    monkeypatch.setattr(webhook, "notify_admin_dashboard", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.services.collection_flow.create_complaint_tracking", create_tracking
+    )
     monkeypatch.setattr(webhook.whatsapp_client, "send_text_message", send_text)
 
     await webhook.receive_webhook(
@@ -658,12 +660,10 @@ async def test_complaint_and_suggestion_create_separate_tracking_rows(
         WebhookSession(),
     )
 
-    assert [item.get("category", "complaint") for item in created] == [
-        "complaint",
-        "suggestion",
-    ]
-    assert "PMC-111111" in outbound_texts[0]["body"]
-    assert "PMC-222222" in outbound_texts[1]["body"]
+    assert created == []
+    assert len(outbound_texts) == 1
+    assert "name" in outbound_texts[0]["body"].casefold()
+    assert "PMC-" not in outbound_texts[0]["body"]
 
 
 @pytest.mark.asyncio

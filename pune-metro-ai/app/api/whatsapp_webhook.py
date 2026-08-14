@@ -12,21 +12,16 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.models import CategoryLog, Conversation, Message, TicketDetails, User, ResponseSourceLog
 from app.db.session import get_db
-from app.services.admin_dashboard import notify_admin_dashboard
 from app.services.brain import respond_with_legacy_context
 from app.services.brain_models import BrainMessage, BrainRequest
 from app.services.complaint_tracking import (
-    complaint_confirmation_reply,
     complaint_contact_redirect_reply,
-    create_complaint_tracking,
     get_latest_complaint_tracking,
     is_contact_request,
     is_complaint_contact_followup,
-    suggestion_confirmation_reply,
 )
 from app.services.collection_flow import (
     advance_collection,
-    parse_contact_number,
     start_collection,
 )
 from app.services.guardrails import apply_guardrails
@@ -38,7 +33,6 @@ from app.services.llm_client import (
     detect_script,
     detect_language_switch_request,
     generate_category_prompt,
-    generate_collection_prompt,
     generate_closing_reply,
     generate_language_switch_confirmation,
     generate_out_of_scope_reply,
@@ -67,44 +61,6 @@ from app.services import whatsapp_calling_client
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-_COLLECTION_NON_ANSWERS = frozenset(
-    {
-        "hi", "hii", "hiii", "hello", "hey", "heyy", "thanks", "thank you",
-        "thank u", "thx", "ok", "okay", "yes", "no", "nope", "wtf", "cool",
-        "sure", "got it", "alright",
-    }
-)
-
-
-def _is_collection_non_answer(value: str) -> bool:
-    normalized = " ".join(value.casefold().strip("!?.,;:").split())
-    return len(normalized) < 2 or normalized in _COLLECTION_NON_ANSWERS
-
-
-_DESCRIPTION_META_PATTERNS = (
-    r"\b(?:you|u) (?:already )?(?:have|got|know) (?:it|this)\b",
-    r"\b(?:described|said|mentioned|told) (?:it|that|this|before|above)\b",
-    r"\b(?:same as|as above)\b",
-)
-
-
-def _is_valid_description(value: str) -> bool:
-    """Accept actual issue/idea detail, never acknowledgements about the flow."""
-    normalized = " ".join(value.casefold().strip("!?.,;:").split())
-    if _is_collection_non_answer(normalized) or len(normalized) < 18:
-        return False
-    return not any(re.search(pattern, normalized) for pattern in _DESCRIPTION_META_PATTERNS)
-
-
-def _has_initial_description(value: str, category: str) -> bool:
-    """Do not treat a bare category request as its own report description."""
-    normalized = " ".join(value.casefold().split())
-    bare_request = re.fullmatch(
-        r"(?:i (?:have|want to make|want to give)|i want|need to)?\s*(?:a )?"
-        rf"{category}(?: please)?", normalized
-    )
-    return not bare_request and _is_valid_description(value)
 
 
 def _correction_station_and_question(
@@ -145,27 +101,6 @@ def _correction_station_and_question(
         question = f"{question} (The correct station is {resolve_station_alias(corrected)}.)"
     return resolve_station_alias(corrected) or corrected, question
 
-
-def _valid_contact_number(value: str) -> str | None:
-    """Return a normalized plausible phone number, or None for invalid input."""
-    return parse_contact_number(value)
-
-
-def _collection_station(value: str) -> str | None:
-    """Resolve a complaint station through the same aliases used for route replies."""
-    return resolve_station_alias(value)
-
-
-def _collection_confirmation_prompt(conversation: Conversation) -> str:
-    """Build the deterministic collected-data summary before registration."""
-    category = getattr(conversation, "pending_category", None) or "complaint"
-    summary = f"Here's what I have:\nName: {getattr(conversation, 'complaint_collection_full_name', '')}\n"
-    summary += (
-        f"Contact: {getattr(conversation, 'complaint_collection_contact_number', '')}\n"
-        f"Station: {getattr(conversation, 'complaint_collection_station', '')}\n"
-    )
-    summary += f"Description: {getattr(conversation, 'complaint_collection_description', '')}\n\n"
-    return f"{summary}Do you want me to register this {category}? (yes/no)"
 
 # ``other_help`` is an interaction id, not a stored category. It intentionally maps
 # to the canonical ``enquiry`` category after selection.
@@ -544,7 +479,8 @@ async def _reply_unsupported_message(
     language, script = resolve_reply_language(profile_name or "")
     if getattr(conversation, "preferred_language", None):
         language = conversation.preferred_language
-    
+        script = "devanagari" if language in {"hindi", "marathi"} else "latin"
+
     reply_key = reply_variant_key(language, script)
     reply = UNSUPPORTED_MESSAGE_REPLIES.get(reply_key, UNSUPPORTED_MESSAGE_REPLIES["english"])
 
@@ -645,7 +581,7 @@ async def _handle_interactive_reply(
         )
     except Exception:
         logger.exception("Failed to generate category prompt for %s", category)
-        prompt = "Please share a little more detail so I can help."
+        prompt = CATEGORY_INPUT_PROMPTS[prompt_key][category]
     if guardrail_reply := apply_guardrails(last_user_message, prompt):
         prompt = guardrail_reply
 
@@ -746,6 +682,15 @@ async def _handle_acknowledgment_message(
     *, sender: str, message_text: str, conversation: Conversation, db: Session
 ) -> None:
     """Close naturally without reopening feedback or a completed complaint flow."""
+    had_prior_assistant_reply = db.scalar(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.role == "assistant",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(1)
+    ) is not None
     language, _ = resolve_reply_language(message_text)
     try:
         reply_text = await generate_closing_reply(
@@ -763,6 +708,8 @@ async def _handle_acknowledgment_message(
         return
     db.add(Message(conversation_id=conversation.id, role="assistant", content=reply_text))
     db.commit()
+    if had_prior_assistant_reply:
+        await _request_feedback(sender, conversation, db)
 
 
 @router.get("/webhook")
@@ -1047,23 +994,6 @@ async def receive_webhook(
         db.commit()
         return {}
 
-    # Do not hand a station-shaped request with no verified station to the LLM.
-    # It is safer to ask for a valid name than to let it autocomplete one.
-    if is_station_or_route_question(message_text) and not find_station_names(message_text):
-        reply_text = generate_unrecognized_station_reply(
-            message_text, getattr(conversation, "preferred_language", None)
-        )
-        try:
-            await whatsapp_client.send_text_message(
-                to=sender, body=_sanitize_outbound_text(reply_text)
-            )
-        except Exception:
-            logger.exception("Failed to send unrecognised-station reply to %s", sender)
-            return {}
-        db.add(Message(conversation_id=conversation.id, role="assistant", content=reply_text))
-        db.commit()
-        return {}
-
     pending_category = getattr(conversation, "pending_category", None)
     # This service is also used after an LLM answer is generated.  Initialising
     # it only inside the cache-read branch caused an UnboundLocalError whenever
@@ -1124,6 +1054,24 @@ async def receive_webhook(
             )
         except Exception:
             logger.exception("Failed to send out-of-scope reply to %s", sender)
+        return {}
+
+    # Only an in-scope classification may enter station repair. Generic routes
+    # such as a Mumbai-to-Pune bus query must be declined as out of scope rather
+    # than being mistaken for a Pune Metro station-name error.
+    if is_station_or_route_question(message_text) and not find_station_names(message_text):
+        reply_text = generate_unrecognized_station_reply(
+            message_text, getattr(conversation, "preferred_language", None)
+        )
+        try:
+            await whatsapp_client.send_text_message(
+                to=sender, body=_sanitize_outbound_text(reply_text)
+            )
+        except Exception:
+            logger.exception("Failed to send unrecognised-station reply to %s", sender)
+            return {}
+        db.add(Message(conversation_id=conversation.id, role="assistant", content=reply_text))
+        db.commit()
         return {}
 
     # A successful non-ambiguous turn breaks any prior post-handoff recovery cycle.
@@ -1317,10 +1265,7 @@ async def _handle_complaint_collection(
     *, sender: str, message_text: str, conversation: Conversation, db: Session
 ) -> None:
     """Handle the step-by-step collection of complaint/suggestion details."""
-    state = getattr(conversation, "complaint_collection_state", None)
-
-    category = getattr(conversation, "pending_category", None) or "complaint"
-    language, script = resolve_reply_language(message_text)
+    language, _ = resolve_reply_language(message_text)
     if not getattr(conversation, "preferred_language", None):
         conversation.preferred_language = language
     prompt, completed = advance_collection(conversation, message_text, db)
@@ -1337,96 +1282,6 @@ async def _handle_complaint_collection(
     db.commit()
     if completed and re.search(r"PMC-\d{6}", prompt):
         await _request_feedback(sender, conversation, db)
-    return
-
-    if state == "collecting_name":
-        if _is_collection_non_answer(message_text):
-            prompt = "Please share your full name so I can continue."
-            if guardrail_reply := apply_guardrails(message_text, prompt):
-                prompt = guardrail_reply
-            db.commit()
-            await whatsapp_client.send_text_message(to=sender, body=_sanitize_outbound_text(prompt))
-            return
-        conversation.complaint_collection_full_name = message_text
-        conversation.complaint_collection_state = "collecting_contact"
-        next_field = "contact number"
-        if state == "collecting_name" and conversation.complaint_collection_state != "confirming":
-            try:
-                prompt = await generate_collection_prompt(category, next_field, language, script)
-            except Exception:
-                prompt = f"Please share your {next_field}."
-    elif state == "collecting_contact":
-        contact_number = _valid_contact_number(message_text)
-        if contact_number is None:
-            prompt = "Please enter a valid contact number using 7 to 15 digits."
-            if guardrail_reply := apply_guardrails(message_text, prompt):
-                prompt = guardrail_reply
-            db.commit()
-            await whatsapp_client.send_text_message(to=sender, body=_sanitize_outbound_text(prompt))
-            return
-        conversation.complaint_collection_contact_number = contact_number
-        conversation.complaint_collection_state = "collecting_station"
-        try:
-            prompt = await generate_collection_prompt(category, "station or location", language, script)
-        except Exception:
-            prompt = "Please share the station or location."
-    elif state == "collecting_station":
-        station = _collection_station(message_text)
-        if station is None:
-            prompt = (
-                "I couldn't match that station. Please send the Pune Metro station name, "
-                "for example PCMC, District Court/Civil Court, Vanaz, or Swargate."
-            )
-            if guardrail_reply := apply_guardrails(message_text, prompt):
-                prompt = guardrail_reply
-            db.commit()
-            await whatsapp_client.send_text_message(to=sender, body=_sanitize_outbound_text(prompt))
-            return
-        conversation.complaint_collection_station = station
-        if getattr(conversation, "complaint_collection_description", None):
-            conversation.complaint_collection_state = "confirming"
-            prompt = _collection_confirmation_prompt(conversation)
-        else:
-            conversation.complaint_collection_state = "collecting_description"
-            try:
-                prompt = await generate_collection_prompt(category, "what happened", language, script)
-            except Exception:
-                prompt = "Please describe what happened."
-    elif state == "collecting_description":
-        if not _is_valid_description(message_text):
-            original = getattr(conversation, "complaint_collection_description", None)
-            if original:
-                conversation.complaint_collection_state = "confirming"
-                prompt = _collection_confirmation_prompt(conversation)
-            else:
-                prompt = "Please describe the issue or suggestion with a little more detail."
-            if guardrail_reply := apply_guardrails(message_text, prompt):
-                prompt = guardrail_reply
-            db.commit()
-            await whatsapp_client.send_text_message(to=sender, body=_sanitize_outbound_text(prompt))
-            return
-        conversation.complaint_collection_description = message_text
-        conversation.complaint_collection_state = "confirming"
-        prompt = _collection_confirmation_prompt(conversation)
-    elif state == "confirming":
-        if message_text.casefold().strip(" .!?।") in {"yes", "yeah", "yep", "हो", "हां", "हाँ", "जी हाँ", "करा", "नोंदवा"}:
-            await _create_complaint_from_collection(sender, conversation, db)
-            return
-        _clear_complaint_collection(conversation)
-        db.commit()
-        prompt = "Okay, I've cancelled the process. How else can I help you?"
-    else:
-        # Fallback for unexpected state
-        conversation.complaint_collection_state = None
-        prompt = "Sorry, something went wrong. Let's start over. How can I help?"
-
-    db.commit()
-    if guardrail_reply := apply_guardrails(message_text, prompt):
-        prompt = guardrail_reply
-    try:
-        await whatsapp_client.send_text_message(to=sender, body=_sanitize_outbound_text(prompt))
-    except Exception:
-        logger.exception("Failed to send complaint collection prompt to %s", sender)
 
 
 def _clear_complaint_collection(conversation: Conversation) -> None:
@@ -1437,68 +1292,6 @@ def _clear_complaint_collection(conversation: Conversation) -> None:
     conversation.complaint_collection_station = None
     conversation.complaint_collection_description = None
     conversation.pending_category = None
-
-
-async def _create_complaint_from_collection(
-    sender: str, conversation: Conversation, db: Session
-) -> None:
-    """Create a complaint or suggestion from the collected details."""
-    category = getattr(conversation, "pending_category", None)
-    message = (
-        f"Name: {getattr(conversation, 'complaint_collection_full_name', '')}\n"
-        f"Contact: {getattr(conversation, 'complaint_collection_contact_number', '')}\n"
-        f"Station: {getattr(conversation, 'complaint_collection_station', '')}\n"
-        f"Description: {getattr(conversation, 'complaint_collection_description', '')}"
-    )
-    category_log = CategoryLog(
-        user_id=conversation.user_id,
-        conversation_id=conversation.id,
-        categories=[category],
-        message=message,
-    )
-    db.add(category_log)
-    db.flush()
-    db.add(TicketDetails(
-        category_log_id=category_log.id,
-        metro_station=getattr(conversation, "complaint_collection_station", None),
-        passenger_name=getattr(conversation, "complaint_collection_full_name", None),
-    ))
-
-    tracking = None
-    if category in {"complaint", "suggestion"}:
-        tracking = create_complaint_tracking(
-            category_log=category_log,
-            user_id=conversation.user_id,
-            conversation_id=conversation.id,
-            db=db,
-            category=category,
-        )
-    # Ticket creation is a terminal collection state. Clear it before any later
-    # feedback interaction can receive another user message.
-    _clear_complaint_collection(conversation)
-    db.commit()
-
-    if category == "complaint" and tracking is not None:
-        reply_text = complaint_confirmation_reply(tracking.token, message, "english")
-    elif category == "suggestion" and tracking is not None:
-        reply_text = suggestion_confirmation_reply(tracking.token, message, "english")
-    else:
-        reply_text = "Your appreciation has been recorded. Thank you for sharing it with us."
-
-    try:
-        await whatsapp_client.send_text_message(to=sender, body=reply_text)
-    except Exception:
-        logger.exception("Failed to send complaint confirmation to %s", sender)
-    
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=reply_text,
-        )
-    )
-    db.commit()
-    await _request_feedback(sender, conversation, db)
 
 
 async def _request_feedback(sender: str, conversation: Conversation, db: Session) -> None:

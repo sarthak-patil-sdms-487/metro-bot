@@ -23,16 +23,21 @@ def tts_cost_inr(characters: int) -> float:
 
 
 def make_llm_log(*, conversation_id: int, channel: str, question: str, answer: str,
-                 call_session_id: int | None = None) -> ResponseSourceLog:
+                 call_session_id: int | None = None, provider: str = "openrouter",
+                 model: str | None = None,
+                 metadata: dict | None = None) -> ResponseSourceLog:
     input_units = estimated_tokens(question)
     output_units = estimated_tokens(answer)
     cost = llm_cost_inr(input_units, output_units)
+    metadata_json = {"usage_kind": "estimated"}
+    if metadata:
+        metadata_json.update(metadata)
     return ResponseSourceLog(
         source="llm", operation="llm", conversation_id=conversation_id,
         call_session_id=call_session_id, channel=channel, question=question,
-        answer=answer, provider="openrouter", model=settings.PRIMARY_LLM_MODEL,
+        answer=answer, provider=provider, model=model or settings.PRIMARY_LLM_MODEL,
         input_units=input_units, output_units=output_units, actual_cost_inr=cost,
-        uncached_cost_inr=cost, metadata_json={"usage_kind": "estimated"},
+        uncached_cost_inr=cost, metadata_json=metadata_json,
     )
 
 

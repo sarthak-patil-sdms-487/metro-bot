@@ -16,6 +16,7 @@ from app.db.models import CategoryLog, ComplaintTracking
 
 logger = logging.getLogger(__name__)
 FALLBACK_MESSAGE = "Sorry, I'm having trouble answering right now. Please try again."
+_shared_http_client: httpx.AsyncClient | None = None
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REFERENCE_FILES = {
     "fares": "fares.md",
@@ -30,6 +31,25 @@ REFERENCE_FILES = {
 FARES_MATRIX_PATH = PROJECT_ROOT / "data" / "fares_matrix.json"
 UPCOMING_LINES_PATH = PROJECT_ROOT / "data" / "upcoming_lines.md"
 STATION_ALIASES_PATH = PROJECT_ROOT / "data" / "station_aliases.json"
+
+
+def _get_shared_http_client() -> httpx.AsyncClient:
+    """Reuse TLS connections across dialogue turns to reduce model latency."""
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        )
+    return _shared_http_client
+
+
+async def close_llm_http_client() -> None:
+    """Close the shared provider connection pool during application shutdown."""
+    global _shared_http_client
+    if _shared_http_client is not None and not _shared_http_client.is_closed:
+        await _shared_http_client.aclose()
+    _shared_http_client = None
 
 
 def _load_fares_matrix() -> dict:
@@ -224,6 +244,7 @@ DEVANAGARI_STATION_ALIASES = {
     "मंडई": "Mahatma Phule Mandai",
     "स्वारगेट": "Swargate",
     "वनाज": "Vanaz",
+    "वनास": "Vanaz",
     "आनंद नगर": "Anand Nagar",
     "आनंदनगर": "Anand Nagar",
     "पौड फाटा": "Paud Phata",
@@ -1483,13 +1504,12 @@ async def _openrouter_chat(
         payload["max_tokens"] = max_tokens
     if response_format is not None:
         payload["response_format"] = response_format
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
-        response = await client.post(
-            f"{settings.PRIMARY_LLM_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.PRIMARY_LLM_API_KEY}"},
-            json=payload,
-        )
-        response.raise_for_status()
+    response = await _get_shared_http_client().post(
+        f"{settings.PRIMARY_LLM_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {settings.PRIMARY_LLM_API_KEY}"},
+        json=payload,
+    )
+    response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
         raise ValueError("OpenRouter returned an empty response")
@@ -1509,16 +1529,15 @@ async def _gemini_generate(
     }
     if generation_config is not None:
         payload["generationConfig"] = generation_config
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{settings.FALLBACK_LLM_MODEL}:generateContent"
-            ),
-            params={"key": settings.FALLBACK_LLM_API_KEY},
-            json=payload,
-        )
-        response.raise_for_status()
+    response = await _get_shared_http_client().post(
+        (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{settings.FALLBACK_LLM_MODEL}:generateContent"
+        ),
+        params={"key": settings.FALLBACK_LLM_API_KEY},
+        json=payload,
+    )
+    response.raise_for_status()
     content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Gemini returned an empty response")

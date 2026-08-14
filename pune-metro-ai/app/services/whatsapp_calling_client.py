@@ -39,7 +39,10 @@ async def startup() -> None:
         from pipecat.transports.whatsapp.client import WhatsAppClient
         from app.services.voice_pipeline import preload_voice_pipeline_dependencies
 
-        await asyncio.to_thread(preload_voice_pipeline_dependencies)
+        # Pipecat's native ONNX/Torch imports can deadlock when their first load
+        # happens in a worker thread. Application startup already waits for this
+        # preload, so initialize them on the startup thread deterministically.
+        preload_voice_pipeline_dependencies()
     except Exception:
         logger.exception("WhatsApp Calling disabled: Pipecat calling dependencies unavailable")
         return

@@ -13,33 +13,23 @@ from typing import Any
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.db.models import CallSession, Conversation, Message, User, ResponseSourceLog, TTSAudioCache
+from app.db.models import CallSession, Conversation, Message, TTSAudioCache, User
 from app.db.session import SessionLocal
-from app.services.brain import respond
-from app.services.brain_models import BrainMessage, BrainRequest
-from app.services.qa_cache import QACacheService
-from app.services.cost_tracking import make_cache_log, make_llm_log, make_tts_log
+from app.services.cost_tracking import make_llm_log, make_tts_log
 from app.services.voice_agent import voice_agent
-from app.services.collection_flow import (
-    advance_collection,
-    collection_resume_reply,
-    compact_voice_confirmation,
-    is_additional_collection_detail,
-    start_collection,
-)
+from app.services.collection_flow import is_additional_collection_detail
 from app.services.whatsapp_client import whatsapp_client
 from app.services.llm_client import (
     FARE_MATRIX,
     OPERATIONAL_LINES,
     build_greeting_reply,
-    classify_message,
     find_station_names,
     find_unsupported_station_names,
     generate_unsupported_station_reply,
-    reply_has_only_canonical_station_names,
     resolve_reply_language,
     short_message_intent,
 )
+from app.services.voice_dialogue import run_voice_dialogue_turn
 
 
 logger = logging.getLogger(__name__)
@@ -49,16 +39,14 @@ GREETING_TEXT = (
     "मी पुणे मेट्रोची सहाय्यक बोलते. मी मराठी, हिंदी आणि इंग्रजी समजू शकते. "
     "मी तुम्हाला कशी मदत करू?"
 )
-MIN_TRANSCRIPTION_CONFIDENCE = 0.60
-# Collection fields are often names, station names, and spoken digits, which STT
-# scores lower than full sentences. Keep them usable while state-specific
-# validation prevents unrelated speech from mutating confirmed data.
-COLLECTION_TRANSCRIPTION_CONFIDENCE = 0.35
-# Keep this short: VAD handles natural pauses before STT finalizes an utterance.
-# This debounce only joins back-to-back final STT frames and must not make the
-# caller wait before every response.
-TURN_AGGREGATION_DELAY_SECONDS = 0.65
-VAD_STOP_SECS = 0.8
+# Pipecat's smart-turn analyzer now owns semantic endpointing. These constants
+# remain public for operational checks, but no STT turn is discarded based on a
+# language score and no fixed debounce delays every response.
+TURN_AGGREGATION_DELAY_SECONDS = 0.0
+VAD_STOP_SECS = 0.6
+# Compatibility values used by operational checks and helper-level tests.
+MIN_TRANSCRIPTION_CONFIDENCE = 0.0
+COLLECTION_TRANSCRIPTION_CONFIDENCE = 0.0
 SUPPORTED_STT_LANGUAGES = frozenset({"en-IN", "hi-IN", "mr-IN"})
 TTS_LANGUAGE_TAG = "\u2063"
 
@@ -82,6 +70,13 @@ def preload_voice_pipeline_dependencies() -> None:
     from pipecat.pipeline.pipeline import Pipeline  # noqa: F401
     from pipecat.pipeline.runner import PipelineRunner  # noqa: F401
     from pipecat.pipeline.task import PipelineTask  # noqa: F401
+    from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (  # noqa: F401
+        LocalSmartTurnAnalyzerV3,
+    )
+    from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: F401
+    from pipecat.processors.aggregators.llm_response_universal import (  # noqa: F401
+        LLMContextAggregatorPair,
+    )
     from pipecat.processors.audio.vad_processor import VADProcessor  # noqa: F401
     from pipecat.services.sarvam.stt import SarvamSTTService  # noqa: F401
     from pipecat.services.sarvam.tts import SarvamTTSService  # noqa: F401
@@ -89,6 +84,7 @@ def preload_voice_pipeline_dependencies() -> None:
 
     # Construct once so the model file is loaded and validated while starting.
     _build_vad_analyzer()
+    LocalSmartTurnAnalyzerV3()
     logger.info(
         "Voice pipeline dependencies preloaded in %.2fs",
         time.monotonic() - started_at,
@@ -206,7 +202,13 @@ def _set_call_state(call_session_id: int, status: str, **values: Any) -> None:
         db.commit()
 
 
-def _transcription_confidence(frame: Any) -> float | None:
+def _language_detection_probability(frame: Any) -> float | None:
+    """Return Sarvam's language-identification score as metadata only.
+
+    Sarvam documents this as the probability that its detected language label
+    is correct. It is not a transcription accuracy/confidence score and must
+    never be used to discard a caller's text.
+    """
     result = getattr(frame, "result", None)
     if not isinstance(result, dict):
         return None
@@ -218,6 +220,39 @@ def _transcription_confidence(frame: Any) -> float | None:
         return float(probability) if probability is not None else None
     except (TypeError, ValueError):
         return None
+
+
+# Compatibility for monitoring code written before the metric was correctly
+# named. Runtime flow never gates a transcript through this alias.
+_transcription_confidence = _language_detection_probability
+
+
+def _tts_reply_chunks(text: str, max_chars: int = 220) -> list[str]:
+    """Split a reply into sentence-sized frames for lower time-to-first-audio."""
+    if len(text) <= max_chars:
+        return [text]
+    ending = END_MARKER if END_MARKER in text else ""
+    clean = text.replace(END_MARKER, "").strip()
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?।])\s+", clean)
+        if part.strip()
+    ]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + 1 + len(sentence) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    if not chunks:
+        chunks = [clean]
+    if ending:
+        chunks[-1] = f"{chunks[-1]} {ending}"
+    return chunks
 
 
 def _mentions_planned_line(text: str) -> bool:
@@ -660,9 +695,9 @@ async def run_voice_pipeline(
 ) -> None:
     """Run one isolated, interruptible voice session inside this FastAPI process."""
     from pipecat.frames.frames import (
-        BotStartedSpeakingFrame,
         BotStoppedSpeakingFrame,
         InputAudioRawFrame,
+        LLMContextFrame,
         TTSAudioRawFrame,
         TTSStoppedFrame,
         TTSSpeakFrame,
@@ -674,9 +709,24 @@ async def run_voice_pipeline(
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineTask
+    from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import (
+        LLMContextAggregatorPair,
+        LLMUserAggregatorParams,
+    )
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+    from pipecat.turns.user_start import (
+        TranscriptionUserTurnStartStrategy,
+        VADUserTurnStartStrategy,
+    )
+    from pipecat.turns.user_stop import (
+        SpeechTimeoutUserTurnStopStrategy,
+        TurnAnalyzerUserTurnStopStrategy,
+    )
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
     from pipecat.services.sarvam.stt import SarvamSTTService
     from pipecat.services.sarvam.tts import SarvamTTSService
     from pipecat.transcriptions.language import Language
@@ -685,187 +735,97 @@ async def run_voice_pipeline(
 
     class TurnState:
         processing = False
-        user_speaking = False
-        closing_requested = False
-        pending_transcriptions: list[Any] = []
-        flush_task: asyncio.Task[Any] | None = None
-        carried_fragments: list[str] = []
-        pending_route_origin: str | None = None
-        pending_route_destination: str | None = None
+        latest_transcription: Any | None = None
 
     turn_state = TurnState()
 
-    class BusyTurnGate(FrameProcessor):
-        """Buffer finalized utterances captured while the previous turn is processing."""
+    class TranscriptionMetadataCapture(FrameProcessor):
+        """Keep provider metadata while native smart-turn aggregates text."""
 
-        async def _flush_pending(self, direction: Any) -> None:
-            await asyncio.sleep(TURN_AGGREGATION_DELAY_SECONDS)
-            while turn_state.processing or turn_state.user_speaking:
-                await asyncio.sleep(0.05)
-            frames = list(turn_state.pending_transcriptions)
-            turn_state.pending_transcriptions.clear()
-            turn_state.flush_task = None
-            if not frames:
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+                turn_state.latest_transcription = frame
+            await self.push_frame(frame, direction)
+
+    class SmartTurnBridge(FrameProcessor):
+        """Convert each completed Pipecat context turn back to one transcript."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.emitted_user_messages = 0
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            if not isinstance(frame, LLMContextFrame):
+                await self.push_frame(frame, direction)
                 return
-            last = frames[-1]
-            # A short low-confidence filler can arrive after a good transcript.
-            # Preserve metadata from the strongest frame so the complete caller
-            # turn is not discarded based only on its final word.
-            metadata_frame = max(
-                frames,
-                key=lambda item: _transcription_confidence(item) or 0.0,
-            )
-            combined = " ".join(item.text.strip() for item in frames if item.text.strip())
-            logger.info("Replaying buffered call transcription: %r", combined)
-            turn_state.processing = True
+
+            messages = getattr(frame.context, "messages", [])
+            if callable(messages):
+                messages = messages()
+            user_messages = [
+                item for item in messages
+                if isinstance(item, dict) and item.get("role") == "user"
+            ]
+            if len(user_messages) <= self.emitted_user_messages:
+                return
+            self.emitted_user_messages = len(user_messages)
+            content = user_messages[-1].get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                return
+            metadata = turn_state.latest_transcription
+            logger.info("Smart turn completed: %r", content.strip())
             await self.push_frame(
                 TranscriptionFrame(
-                    text=combined,
-                    user_id=last.user_id,
-                    timestamp=last.timestamp,
-                    language=metadata_frame.language,
-                    result=metadata_frame.result,
+                    text=content.strip(),
+                    user_id=getattr(metadata, "user_id", str(user_id)),
+                    timestamp=getattr(metadata, "timestamp", ""),
+                    language=getattr(metadata, "language", None),
+                    result=getattr(metadata, "result", None),
                     finalized=True,
                 ),
                 direction,
             )
 
-        async def process_frame(self, frame: Any, direction: Any) -> None:
-            await super().process_frame(frame, direction)
-            if isinstance(frame, UserStartedSpeakingFrame):
-                turn_state.user_speaking = True
-                await self.push_frame(frame, direction)
-                return
-            if isinstance(frame, UserStoppedSpeakingFrame):
-                turn_state.user_speaking = False
-                await self.push_frame(frame, direction)
-                return
-            if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-                turn_state.pending_transcriptions.append(frame)
-                if turn_state.processing:
-                    if _is_no_more_enquiry(frame.text):
-                        turn_state.closing_requested = True
-                        logger.info(
-                            "Caller requested closing; pending voice reply will be suppressed"
-                        )
-                    else:
-                        logger.info(
-                            "Buffering call transcription while response is processing: %r",
-                            frame.text.strip(),
-                        )
-                if turn_state.flush_task is not None:
-                    turn_state.flush_task.cancel()
-                # Debounce briefly after silence; VAD still lets a caller finish a
-                # natural pause without adding a long fixed delay to every turn.
-                turn_state.flush_task = asyncio.create_task(
-                    self._flush_pending(direction)
-                )
-                if turn_state.user_speaking:
-                    logger.info(
-                        "Deferring finalized transcription until caller stops speaking: %r",
-                        frame.text.strip(),
-                    )
-                return
-            await self.push_frame(frame, direction)
+    class AIDialogueProcessor(FrameProcessor):
+        """Run every completed caller turn through the structured controller."""
 
-    class SharedBrainProcessor(FrameProcessor):
         def __init__(self) -> None:
             super().__init__()
-            self.bot_speaking = False
             self.turn_lock = asyncio.Lock()
 
         async def process_frame(self, frame: Any, direction: Any) -> None:
             await super().process_frame(frame, direction)
-            if isinstance(frame, BotStartedSpeakingFrame):
-                self.bot_speaking = True
-                await self.push_frame(frame, direction)
-                return
-            if isinstance(frame, BotStoppedSpeakingFrame):
-                self.bot_speaking = False
-                await self.push_frame(frame, direction)
-                return
             if not isinstance(frame, TranscriptionFrame) or not frame.text.strip():
                 await self.push_frame(frame, direction)
                 return
+
             text = frame.text.strip()
-            if turn_state.carried_fragments:
-                text = " ".join([*turn_state.carried_fragments, text])
-                turn_state.carried_fragments.clear()
-                logger.info("Combined carried call fragments: %r", text)
-            is_closing_turn = _is_no_more_enquiry(text)
-            if is_closing_turn:
-                turn_state.closing_requested = False
-            confidence = _transcription_confidence(frame)
-            stt_language = _transcription_language_code(frame)
-            if stt_language and stt_language not in SUPPORTED_STT_LANGUAGES:
-                # Sarvam occasionally labels an English station name as Gujarati
-                # or Bengali. A locally verified station is safe to accept.
-                if not find_station_names(text):
-                    logger.info(
-                        "Ignoring unsupported-language call transcription %s: %r",
-                        stt_language,
-                        text,
-                    )
-                    turn_state.processing = False
-                    return
-            with SessionLocal() as state_db:
-                active_collection = bool(
-                    (active_conversation := state_db.get(Conversation, conversation_id))
-                    and active_conversation.complaint_collection_state
-                )
-            minimum_confidence = (
-                COLLECTION_TRANSCRIPTION_CONFIDENCE
-                if active_collection
-                else MIN_TRANSCRIPTION_CONFIDENCE
-            )
-            # Station names and explicit call controls are validated locally.
-            # Sarvam often assigns mixed Latin/Devanagari utterances a score just
-            # below 0.60, so dropping these safe turns makes the call appear stuck.
-            trusted_low_confidence_turn = bool(find_station_names(text)) or bool(
-                voice_agent.is_resume_collection(text)
-            ) or _is_no_more_enquiry(text) or bool(
-                re.search(
-                    r"\b(?:cancel|stop|resume|continue|proceed|yes|no)\b|"
-                    r"रद्द|थांबा|पुढे\s*(?:जा|घ्या|जाऊ)|जारी\s*रखें|"
-                    r"आगे\s*बढ़|हाँ|हां|हो|नाही|नहीं",
-                    text.casefold(),
-                )
-            )
-            if trusted_low_confidence_turn:
-                minimum_confidence = min(minimum_confidence, 0.25)
-            if confidence is not None and confidence < minimum_confidence:
-                logger.info(
-                    "Ignoring low-confidence call transcription %.3f (minimum %.2f): %r",
-                    confidence,
-                    minimum_confidence,
-                    text,
-                )
-                turn_state.processing = False
-                return
-            if self.bot_speaking:
-                if _is_actionable_barge_in(text, active_collection=active_collection):
-                    # Preserve deliberate interruptions such as a destination,
-                    # enquiry, cancellation, or explicitly added complaint detail.
-                    turn_state.carried_fragments.append(text)
-                    logger.info("Carrying actionable barge-in during bot speech: %r", text)
-                else:
-                    logger.info("Ignoring non-actionable speech during bot response: %r", text)
-                turn_state.processing = False
-                return
-            if _is_incomplete_voice_fragment(text):
-                turn_state.carried_fragments.append(text)
-                logger.info("Carrying incomplete call fragment into next turn: %r", text)
-                turn_state.processing = False
-                return
-            if self.turn_lock.locked():
-                logger.info("Ignoring overlapping call transcription: %r", text)
-                turn_state.processing = False
-                return
-            turn_started = time.monotonic()
+            started = time.monotonic()
             db = None
+            reply = ""
+            response_language = _reply_language_from_stt(
+                _transcription_language_code(frame), text
+            )
+            chat_notification: str | None = None
+            notification_number: str | None = None
+            turn_state.processing = True
             try:
                 async with self.turn_lock:
                     db = SessionLocal()
+                    conversation = db.get(Conversation, conversation_id)
+                    if conversation is None:
+                        raise RuntimeError(
+                            f"Conversation {conversation_id} disappeared during call"
+                        )
+                    collected_snapshot = {
+                        "category": conversation.pending_category or "complaint",
+                        "name": conversation.complaint_collection_full_name,
+                        "contact": conversation.complaint_collection_contact_number,
+                        "station": conversation.complaint_collection_station,
+                        "description": conversation.complaint_collection_description,
+                    }
                     user_message = Message(
                         conversation_id=conversation_id,
                         role="user",
@@ -881,243 +841,72 @@ async def run_voice_pipeline(
                                 Message.id != user_message.id,
                             )
                             .order_by(Message.created_at.desc(), Message.id.desc())
-                            .limit(20)
+                            .limit(16)
                         )
                     )
-                    user = db.get(User, user_id)
-                    caller_language = _reply_language_from_stt(stt_language, text)
-                    conversation = db.get(Conversation, conversation_id)
-                    collection_reply = None
-                    collection_completed = False
-                    chat_notification = None
-                    collection_language = caller_language
-                    collection_paused_for_enquiry = False
-                    if (
-                        conversation
-                        and conversation.complaint_collection_state
-                        and voice_agent.is_resume_collection(text)
-                    ):
-                        collection_language = (
-                            conversation.preferred_language or caller_language
-                        )
-                        collection_reply = collection_resume_reply(conversation)
-                        logger.info("Resuming paused voice collection: %r", text)
-                    elif (
-                        conversation
-                        and conversation.complaint_collection_state
-                        and voice_agent.is_explicit_enquiry(text)
-                    ):
-                        # Preserve every collected field while answering a clear,
-                        # unrelated Metro enquiry for one turn.
-                        collection_paused_for_enquiry = True
-                        collection_language = (
-                            conversation.preferred_language or caller_language
-                        )
-                        logger.info("Pausing voice collection for enquiry: %r", text)
-                    elif conversation and conversation.complaint_collection_state:
-                        collection_language = (
-                            conversation.preferred_language or caller_language
-                        )
-                        collected_snapshot = {
-                            "name": conversation.complaint_collection_full_name,
-                            "contact": conversation.complaint_collection_contact_number,
-                            "station": conversation.complaint_collection_station,
-                            "description": conversation.complaint_collection_description,
-                        }
-                        collection_reply, collection_completed = advance_collection(conversation, text, db)
-                        if (
-                            not collection_completed
-                            and conversation.complaint_collection_state == "confirming"
-                        ):
-                            collection_reply = compact_voice_confirmation(conversation)
-                        if collection_completed and re.search(r"PMC-\d{6}", collection_reply):
-                            if collection_language == "marathi":
-                                details = (
-                                    f"नाव: {collected_snapshot['name']}\n"
-                                    f"संपर्क क्रमांक: {collected_snapshot['contact']}\n"
-                                    f"स्थानक: {collected_snapshot['station']}\n"
-                                    f"तक्रार: {collected_snapshot['description']}"
-                                )
-                            elif collection_language == "hindi":
-                                details = (
-                                    f"नाम: {collected_snapshot['name']}\n"
-                                    f"संपर्क नंबर: {collected_snapshot['contact']}\n"
-                                    f"स्टेशन: {collected_snapshot['station']}\n"
-                                    f"शिकायत: {collected_snapshot['description']}"
-                                )
-                            else:
-                                details = (
-                                    f"Name: {collected_snapshot['name']}\n"
-                                    f"Contact: {collected_snapshot['contact']}\n"
-                                    f"Station: {collected_snapshot['station']}\n"
-                                    f"Complaint: {collected_snapshot['description']}"
-                                )
-                            chat_notification = f"{collection_reply}\n\n{details}"
-                    elif conversation:
-                        collection_category = voice_agent.collection_category(text)
-                        if collection_category:
-                            collection_reply = start_collection(
-                                conversation,
-                                collection_category,
-                                text,
-                                language=caller_language,
-                            )
-                            if conversation.complaint_collection_state == "confirming":
-                                collection_reply = compact_voice_confirmation(conversation)
                     last_assistant = next(
-                        (item for item in stored if item.role == "assistant"), None
+                        (item.content for item in stored if item.role == "assistant"),
+                        None,
                     )
-                    planned_line_context = any(
-                        _mentions_planned_line(item.content) for item in stored[:2]
+                    result = await run_voice_dialogue_turn(
+                        text=text,
+                        conversation=conversation,
+                        history=[
+                            {"role": item.role, "content": item.content}
+                            for item in reversed(stored)
+                            if item.role in {"user", "assistant"}
+                        ],
+                        db=db,
+                        language_hint=response_language,
+                        last_assistant_reply=last_assistant,
                     )
-                    closing_reply = _call_closing_reply(
-                        text,
-                        caller_language,
-                        allow_bare_negative=bool(
-                            last_assistant
-                            and _offered_more_help(last_assistant.content)
-                        ),
-                    )
-                    current_stations = find_station_names(text)
-                    if len(current_stations) >= 2:
-                        # A complete route supersedes any earlier clarification.
-                        turn_state.pending_route_origin = None
-                        turn_state.pending_route_destination = None
-                    if (
-                        turn_state.pending_route_destination
-                        and len(current_stations) == 1
-                        and current_stations[0] != turn_state.pending_route_destination
-                    ):
-                        fast_reply = (
-                            _voice_route_reply(
-                                current_stations[0],
-                                turn_state.pending_route_destination,
-                                caller_language,
-                            ),
-                            caller_language,
+                    response_language = result.language
+                    reply = result.reply_text.strip()
+
+                    if result.intent == "close":
+                        reply = _call_closing_reply(text, response_language) or {
+                            "hindi": f"पुणे मेट्रो को कॉल करने के लिए धन्यवाद। नमस्कार। {END_MARKER}",
+                            "marathi": f"पुणे मेट्रोला कॉल केल्याबद्दल धन्यवाद. नमस्कार. {END_MARKER}",
+                        }.get(
+                            response_language,
+                            f"Thanks for calling Pune Metro. Goodbye. {END_MARKER}",
                         )
-                        turn_state.pending_route_destination = None
-                    elif (
-                        turn_state.pending_route_origin
-                        and len(current_stations) == 1
-                        and current_stations[0] != turn_state.pending_route_origin
-                    ):
-                        fast_reply = (
-                            _voice_route_reply(
-                                turn_state.pending_route_origin,
-                                current_stations[0],
-                                caller_language,
-                            ),
-                            caller_language,
-                        )
-                        turn_state.pending_route_origin = None
-                    else:
-                        fast_reply = _fast_voice_reply(
-                            text, planned_line_context=planned_line_context
-                        )
-                        if route_role := _single_station_route_role(text):
-                            station, role = route_role
-                            if role == "destination":
-                                turn_state.pending_route_destination = station
-                                turn_state.pending_route_origin = None
-                            else:
-                                turn_state.pending_route_origin = station
-                                turn_state.pending_route_destination = None
-                    if (
-                        closing_reply is None
-                        and last_assistant
-                        and _offered_more_help(last_assistant.content)
-                        and " ".join(text.casefold().strip("!?.,;:।").split())
-                        in {"yes", "yeah", "yep", "हो", "हां", "हाँ", "जी"}
-                    ):
-                        fast_reply = (
-                            voice_agent.ask_question_reply(caller_language),
-                            caller_language,
-                        )
-                    if collection_reply is not None:
-                        reply = collection_reply
-                        response_language = collection_language
-                    elif closing_reply is not None:
-                        reply = closing_reply
-                        response_language = caller_language
-                    elif fast_reply is not None:
-                        reply, _detected_language = fast_reply
-                        response_language = caller_language
-                        db.add(ResponseSourceLog(
-                            source="rules", operation="llm", conversation_id=conversation_id,
-                            call_session_id=call_session_id, channel="call", question=text,
-                            answer=reply, provider="local", model="deterministic-rules",
-                            actual_cost_inr=0.0, uncached_cost_inr=0.0,
-                        ))
-                    else:
-                        qa_cache = QACacheService(db)
-                        cached_entry = qa_cache.get_cached_entry(text, caller_language)
-                        if cached_entry and reply_has_only_canonical_station_names(cached_entry.answer):
-                            reply = cached_entry.answer
-                            db.add(make_cache_log(
-                                conversation_id=conversation_id, channel="call", question=text,
-                                answer=reply, cache_entry_id=cached_entry.id,
-                                call_session_id=call_session_id,
-                            ))
-                        else:
-                            request = BrainRequest(
-                                user_id=user_id,
-                                user_identity=user.whatsapp_number if user else str(user_id),
-                                channel="call", text=text, conversation_id=conversation_id,
-                                session_id=call_session_id,
-                                history=[BrainMessage(role=item.role, content=item.content)
-                                         for item in reversed(stored)
-                                         if item.role in {"user", "assistant"}],
-                                preferred_language=caller_language,
-                            )
-                            response = await respond(request, db)
-                            feedback_category = next(
-                                (category for category in response.categories
-                                 if category in {"complaint", "suggestion", "appreciation"}),
-                                None,
-                            )
-                            if feedback_category and conversation:
-                                reply = start_collection(
-                                    conversation,
-                                    feedback_category,
-                                    text,
-                                    language=caller_language,
-                                )
-                                collection_reply = reply
-                                collection_language = caller_language
-                                if conversation.complaint_collection_state == "confirming":
-                                    collection_reply = compact_voice_confirmation(conversation)
-                            else:
-                                reply = response.reply_text.strip()
-                                db.add(make_llm_log(
-                                    conversation_id=conversation_id, channel="call", question=text,
-                                    answer=reply, call_session_id=call_session_id,
-                                ))
-                                qa_cache.store_answer(text, reply, caller_language, "enquiry")
-                        response_language = caller_language
-                    if collection_paused_for_enquiry:
-                        reply = (
-                            f"{reply} "
-                            f"{voice_agent.paused_collection_reminder(collection_language, conversation.pending_category or 'complaint')}"
-                        )
-                        response_language = collection_language
-                    elif collection_completed:
+                    elif result.completed and result.tracking_id:
                         reply = _continue_call_after_collection(
                             reply, response_language
                         )
-                    elif closing_reply is None and collection_reply is None:
-                        reply = _offer_more_help(reply, response_language)
-                    # Keep the internal hang-up marker out of text sanitization;
-                    # removing underscores used to turn it into [ENDCALL], so the
-                    # detector missed it and the bot answered again after farewell.
-                    reply = _sanitize_reply_with_end_marker(reply)
-                    if turn_state.closing_requested and not is_closing_turn:
-                        db.commit()
-                        logger.info(
-                            "Suppressing superseded voice reply for call session %s",
-                            call_session_id,
+                        details = (
+                            f"Name: {collected_snapshot['name']}\n"
+                            f"Contact: {collected_snapshot['contact']}\n"
+                            f"Station: {collected_snapshot['station']}\n"
+                            f"{str(collected_snapshot['category']).title()}: "
+                            f"{collected_snapshot['description']}"
                         )
-                        return
+                        chat_notification = f"{result.reply_text}\n\n{details}"
+                        user = db.get(User, user_id)
+                        notification_number = user.whatsapp_number if user else None
+
+                    reply = _sanitize_reply_with_end_marker(reply)
+                    db.add(
+                        make_llm_log(
+                            conversation_id=conversation_id,
+                            channel="call",
+                            question=text,
+                            answer=reply,
+                            call_session_id=call_session_id,
+                            provider=result.provider,
+                            model=result.model,
+                            metadata={
+                                "controller": "structured_voice_v1",
+                                "intent": result.intent,
+                                "state_before": result.state_before,
+                                "state_after": result.state_after,
+                                "controller_latency_ms": result.controller_latency_ms,
+                                "language_probability": _language_detection_probability(frame),
+                                "validation_errors": list(result.validation_errors),
+                            },
+                        )
+                    )
                     db.add(
                         Message(
                             conversation_id=conversation_id,
@@ -1125,7 +914,9 @@ async def run_voice_pipeline(
                             content=reply,
                         )
                     )
-                    spoken_language = _spoken_reply_language(reply, response_language)
+                    spoken_language = _spoken_reply_language(
+                        reply, response_language
+                    )
                     call = db.get(CallSession, call_session_id)
                     if call and spoken_language not in call.detected_languages:
                         call.detected_languages = [
@@ -1133,39 +924,42 @@ async def run_voice_pipeline(
                             spoken_language,
                         ]
                     db.commit()
-                    if chat_notification and user:
-                        try:
-                            await whatsapp_client.send_text_message(
-                                to=user.whatsapp_number,
-                                body=chat_notification,
-                            )
-                            logger.info(
-                                "Sent voice complaint confirmation to WhatsApp chat for call session %s",
-                                call_session_id,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Failed to send voice complaint confirmation to chat for call session %s",
-                                call_session_id,
-                            )
+            except asyncio.CancelledError:
+                logger.info(
+                    "Voice response interrupted by caller for call session %s",
+                    call_session_id,
+                )
+                raise
             finally:
                 if db is not None:
                     db.close()
                 turn_state.processing = False
+
+            if chat_notification and notification_number:
+                try:
+                    await whatsapp_client.send_text_message(
+                        to=notification_number,
+                        body=chat_notification,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send voice complaint confirmation to chat for call session %s",
+                        call_session_id,
+                    )
             logger.info(
-                "Voice turn response ready in %.2fs for call session %s",
-                time.monotonic() - turn_started,
+                "Structured voice response ready in %.2fs for call session %s",
+                time.monotonic() - started,
                 call_session_id,
             )
-            await self.push_frame(
-                TTSSpeakFrame(
-                    text=_tag_tts_text(
-                        reply, _spoken_reply_language(reply, response_language)
+            spoken_language = _spoken_reply_language(reply, response_language)
+            for chunk in _tts_reply_chunks(reply):
+                await self.push_frame(
+                    TTSSpeakFrame(
+                        text=_tag_tts_text(chunk, spoken_language),
+                        append_to_context=False,
                     ),
-                    append_to_context=False,
-                ),
-                direction,
-            )
+                    direction,
+                )
 
     class GreetingProtector(FrameProcessor):
         """Prevent microphone noise from interrupting the prerecorded greeting."""
@@ -1181,28 +975,7 @@ async def run_voice_pipeline(
             if (
                 direction == FrameDirection.DOWNSTREAM
                 and isinstance(frame, InputAudioRawFrame)
-                and time.monotonic() - self.started_at < 4.5
-            ):
-                return
-            await self.push_frame(frame, direction)
-
-    class BotSpeechInputGate(FrameProcessor):
-        """Prevent speaker echo from becoming a new caller turn."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.bot_speaking = False
-
-        async def process_frame(self, frame: Any, direction: Any) -> None:
-            await super().process_frame(frame, direction)
-            if isinstance(frame, BotStartedSpeakingFrame):
-                self.bot_speaking = True
-            elif isinstance(frame, BotStoppedSpeakingFrame):
-                self.bot_speaking = False
-            elif (
-                direction == FrameDirection.DOWNSTREAM
-                and self.bot_speaking
-                and isinstance(frame, InputAudioRawFrame)
+                and time.monotonic() - self.started_at < 0.8
             ):
                 return
             await self.push_frame(frame, direction)
@@ -1414,17 +1187,42 @@ async def run_voice_pipeline(
 
     tts.run_tts = types.MethodType(multilingual_run_tts, tts)
     tts.append_to_audio_context = types.MethodType(caching_append_to_audio_context, tts)
+    smart_turn_context = LLMContext()
+    smart_turn_pair = LLMContextAggregatorPair(
+        smart_turn_context,
+        user_params=LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(enable_interruptions=True),
+                    TranscriptionUserTurnStartStrategy(use_interim=True),
+                ],
+                stop=[
+                    TurnAnalyzerUserTurnStopStrategy(
+                        turn_analyzer=LocalSmartTurnAnalyzerV3(),
+                        wait_for_transcript=True,
+                    ),
+                    SpeechTimeoutUserTurnStopStrategy(
+                        user_speech_timeout=1.1,
+                        wait_for_transcript=True,
+                    ),
+                ],
+            ),
+            filter_incomplete_user_turns=True,
+        ),
+        realtime_service_mode=False,
+    )
     pipeline = Pipeline(
         [
             transport.input(),
             GreetingProtector(),
-            BotSpeechInputGate(),
             VADProcessor(
                 vad_analyzer=_build_vad_analyzer()
             ),
             stt,
-            BusyTurnGate(),
-            SharedBrainProcessor(),
+            TranscriptionMetadataCapture(),
+            smart_turn_pair.user(),
+            SmartTurnBridge(),
+            AIDialogueProcessor(),
             CallEndDetector(),
             tts,
             transport.output(),

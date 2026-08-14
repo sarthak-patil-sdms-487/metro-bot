@@ -136,6 +136,10 @@ def test_natural_description_without_keyword_advances_to_confirmation(db: Sessio
             "मेरी शिकायत दर्ज करनी है कि टिकट मशीन पैसे काट रही है लेकिन टिकट नहीं दे रही।",
             "टिकट मशीन पैसे काट रही है लेकिन टिकट नहीं दे रही।",
         ),
+        (
+            "वहाँ कुत्ते बहुत बढ़ गए हैं।",
+            "कुत्ते बहुत बढ़ गए हैं।",
+        ),
     ),
 )
 def test_description_keeps_only_substantive_complaint(

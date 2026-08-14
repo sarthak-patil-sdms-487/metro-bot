@@ -146,6 +146,7 @@ def _extract_name(text: str) -> str | None:
         r"माझ(?:ं|े) पूर्ण नाव\s+आहे\s+([^,.।!?]{2,60}?)(?:[,.।!?]|$)",
         r"माझ(?:ं|े) नाव\s+आहे\s+([^,.।!?]{2,60}?)(?:[,.।!?]|$)",
         r"माझ(?:ं|े) नाव\s+([^,.।!?]{2,60}?)(?:\s+आहे|[,.।!?]|$)",
+        r"मेरा पूरा नाम\s+(?:है\s+)?([^,.।!?]{2,60}?)(?:[,.।!?]|$)",
         r"मेरा नाम\s+है\s+([^,.।!?]{2,60}?)(?:[,.।!?]|$)",
         r"मेरा नाम\s+([^,.।!?]{2,60}?)(?:\s+है|[,.।!?]|$)",
     )
@@ -226,6 +227,17 @@ def _normalize_description(text: str) -> str:
         r"^(?:(?:um+|uh+|actually|basically|देखिए|मतलब|अं|अरे|बरं|तर)\s*[,.-]?\s*)+",
         "",
         value,
+        flags=re.I,
+    ).strip()
+    # Station is stored in its own validated field. Drop a dangling locative
+    # pronoun so the dashboard description reads as the actionable issue rather
+    # than "there ..." without context.
+    value = re.sub(
+        r"^(?:there|at\s+that\s+station|वहाँ|वहां|उस\s+स्टेशन\s+पर|"
+        r"तिथे|त्या\s+स्थानकावर)\s*[,;:-]?\s*",
+        "",
+        value,
+        count=1,
         flags=re.I,
     ).strip()
     return value.strip(" ,;:-")
@@ -463,7 +475,8 @@ def _yes(text: str) -> bool:
         "everything is correct", "everything's correct", "all correct", "all good",
         "you can register", "you can go ahead", "you can do it", "please register", "yes do it",
         "सब सही है", "सभी सही है", "सब ठीक है", "जानकारी सही है",
-        "दर्ज कर दीजिए", "नोंद कर दीजिए", "आप दर्ज कर सकते हैं", "आप कर सकते हैं",
+        "दर्ज कर दीजिए", "दर्ज करिए", "दर्ज करें", "नोंद कर दीजिए",
+        "आप दर्ज कर सकते हैं", "आप कर सकते हैं",
         "आगे बढ़", "आगे बढ़",
         "सगळं बरोबर आहे", "सर्व बरोबर आहे", "माहिती बरोबर आहे",
         "नोंदवू शकता", "नोंद करा", "तुम्ही नोंद करू शकता", "तुम्ही करू शकता",

@@ -15,6 +15,17 @@ from app.db.models import QACache
 logger = logging.getLogger(__name__)
 
 
+def _cache_clock(last_used: datetime) -> tuple[datetime, datetime]:
+    """Return comparable UTC timestamps even when a DB driver drops tzinfo."""
+    now = datetime.now(timezone.utc)
+    comparable_last_used = (
+        last_used.replace(tzinfo=timezone.utc)
+        if last_used.tzinfo is None
+        else last_used.astimezone(timezone.utc)
+    )
+    return now, comparable_last_used
+
+
 def is_cacheable_question(text: str) -> bool:
     """Allow answer reuse only for turns that look like information requests.
 
@@ -72,8 +83,7 @@ class QACacheService:
                 )
             )
             if cache_entry:
-                last_used = cache_entry.last_used_at
-                now = datetime.now(timezone.utc) if last_used.tzinfo else datetime.utcnow()
+                now, last_used = _cache_clock(cache_entry.last_used_at)
                 if now - last_used > timedelta(hours=settings.QA_CACHE_TTL_HOURS):
                     self.db.delete(cache_entry)
                     self.db.commit()
@@ -88,8 +98,7 @@ class QACacheService:
             for entry in all_questions:
                 similarity = SequenceMatcher(None, normalized_question, entry.normalized_question).ratio()
                 if similarity >= settings.QA_CACHE_FUZZY_THRESHOLD:
-                    last_used = entry.last_used_at
-                    now = datetime.now(timezone.utc) if last_used.tzinfo else datetime.utcnow()
+                    now, last_used = _cache_clock(entry.last_used_at)
                     if now - last_used > timedelta(hours=settings.QA_CACHE_TTL_HOURS):
                         self.db.delete(entry)
                         self.db.commit()
@@ -119,9 +128,7 @@ class QACacheService:
             if cache_entry:
                 cache_entry.answer = answer
                 cache_entry.category = category
-                cache_entry.last_used_at = (
-                    datetime.now(timezone.utc) if cache_entry.last_used_at.tzinfo else datetime.utcnow()
-                )
+                cache_entry.last_used_at = datetime.now(timezone.utc)
             else:
                 self.db.add(QACache(normalized_question=normalized_question, answer=answer,
                                     language=language, category=category))

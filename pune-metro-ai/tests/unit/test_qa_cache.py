@@ -1,7 +1,8 @@
 """Unit tests for the QA cache service."""
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -38,7 +39,9 @@ def test_cache_ttl(db: Session) -> None:
     
     # Manually expire the cache entry
     cache_entry = db.scalar(select(QACache))
-    cache_entry.last_used_at = datetime.utcnow() - timedelta(hours=settings.QA_CACHE_TTL_HOURS + 1)
+    cache_entry.last_used_at = datetime.now(timezone.utc) - timedelta(
+        hours=settings.QA_CACHE_TTL_HOURS + 1
+    )
     db.commit()
 
     answer = service.get_cached_answer("What is the fare from Swargate to PCMC?", "english")
